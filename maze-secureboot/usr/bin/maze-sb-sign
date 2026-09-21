@@ -1,0 +1,534 @@
+#!/bin/sh
+# Managed by Maze Linux. Signs the kernel-install-built Unified Kernel Image
+# (layout=uki) that shim chainloads as grubx64.efi. Idempotent.
+# Usage: maze-sb-sign [ESP_MOUNTPOINT] [--force-bootloader]
+set -eu
+
+KEYDIR=/var/lib/maze-secureboot
+KEY="$KEYDIR/MOK.key"
+CRT="$KEYDIR/MOK.crt"
+CER="$KEYDIR/MOK.cer"
+
+[ -r "$KEY" ] && [ -r "$CRT" ] || { echo "maze-sb-sign: no MOK key, skipping" >&2; exit 0; }
+
+# Serialize all invocations. This script is triggered from up to three
+# independent, overlapping sources for a single kernel update — the
+# 85-maze-kernel-install.hook -> kernel-install add -> 95-maze-sb-sign.install
+# plugin, the zz-maze-secureboot.hook (same pacman transaction), and the
+# maze-sb-resign.path unit reacting to the new UKI file appearing under
+# $ESP/EFI/Linux. Without a lock, two concurrent instances can both sign the
+# same file to the same fixed temp name (sign_inplace's "$f.maze-signed" /
+# the grubx64.efi temp below) and race each other's write, producing a
+# truncated/corrupt result on disk. Confirmed in production: overlapping
+# maze-sb-resign.service runs 0 seconds apart left a 63%-truncated UKI and a
+# kernel panic ("No working init found") on next boot. The lock makes every
+# invocation, regardless of trigger, run one at a time.
+LOCKFILE=/run/lock/maze-sb-sign.lock
+# /run/lock can be absent when /run is a fresh tmpfs (e.g. some chroot setups
+# mount their own /run) — without this, exec 9> fails and set -eu aborts the
+# whole signing run.
+mkdir -p /run/lock
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "maze-sb-sign: another instance is running, waiting..." >&2
+    flock 9
+fi
+
+ESP=""
+force_bootloader=0
+for arg in "$@"; do
+    case "$arg" in
+        --force-bootloader) force_bootloader=1 ;;
+        *) ESP="$arg" ;;
+    esac
+done
+
+if [ -z "$ESP" ]; then
+    ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+    [ -n "${ESP:-}" ] && [ -d "$ESP" ] || ESP=/efi
+    [ -d "$ESP" ] || ESP=/boot
+fi
+if [ ! -d "$ESP" ]; then
+    echo "maze-sb-sign: ESP path '$ESP' does not exist" >&2
+    exit 1
+fi
+
+status_ok=1
+
+install_if_diff() {
+    [ -f "$1" ] || return 0
+    cmp -s "$1" "$2" 2>/dev/null && return 0
+    install -m644 "$1" "$2"
+}
+
+sign_inplace() {
+    f="$1"
+    [ -e "$f" ] || return 0
+    if sbverify --cert "$CRT" "$f" >/dev/null 2>&1; then
+        echo "maze-sb-sign: OK     $f"
+        return 0
+    fi
+    if sbsign --key "$KEY" --cert "$CRT" --output "$f.maze-signed" "$f" 2>/dev/null; then
+        mv -f "$f.maze-signed" "$f"
+        echo "maze-sb-sign: SIGNED $f"
+    else
+        rm -f "$f.maze-signed"
+        echo "maze-sb-sign: FAIL   $f" >&2
+        status_ok=0
+    fi
+}
+
+BOOTDIR="$ESP/EFI/BOOT"
+mkdir -p "$BOOTDIR"
+install_if_diff "$KEYDIR/shimx64.efi" "$BOOTDIR/BOOTX64.EFI"
+install_if_diff "$KEYDIR/mmx64.efi"   "$BOOTDIR/mmx64.efi"
+install_if_diff "$CER"                "$ESP/MOK.cer"
+
+# --- Sign the UKI and install as grubx64.efi (shim's second stage) ---
+# /etc/kernel/install.conf ships `layout=uki`, so `kernel-install add` (run by
+# Calamares' bootloader module, and again below by deploy-to-target.sh) already
+# built a real UKI (kernel + initramfs + /etc/kernel/cmdline + systemd PE stub,
+# via kernel-install's own ukify plugin) at $ESP/EFI/Linux/<machine-id>-<kver>.efi.
+# No manual `ukify build` needed here — just sign that file and install it as
+# grubx64.efi, the exact name shim chainloads. This makes the boot chain
+# portable across ALL UEFI firmware (shim verifies its second stage via
+# shim_lock/MOK, never via db).
+GRUB="$BOOTDIR/grubx64.efi"
+
+# --- Choose the UKI by INSTALLED KERNEL VERSION, never by mtime ------------
+# This used to be `ls -t "$ESP"/EFI/Linux/*.efi | head -1`, i.e. "whichever file
+# is newest". That is wrong in precisely the case that matters. On a kernel
+# upgrade pacman DELETES /usr/lib/modules/<old>, but nothing removes the old
+# kernel's UKI from the ESP (kernel-install remove is never invoked for an Arch
+# kernel upgrade, and mkinitcpio's remove hook only deletes what the preset
+# lists — loose /boot images, never $ESP/EFI/Linux/*.efi). So the ESP keeps a
+# UKI for a kernel that has no modules on disk. If `kernel-install add` for the
+# NEW kernel then fails — or an older UKI simply gets a fresher mtime from the
+# re-sign pass below — the mtime rule hands that dead kernel to shim as
+# grubx64.efi and every layer reports success. The machine boots a kernel that
+# cannot load a single module: vfat never comes up, /boot cannot be mounted,
+# and there is no error message anywhere to explain it.
+#
+# Selecting by version removes the guesswork, and the modules-on-disk check
+# below turns the silent brick into a loud, actionable failure.
+
+# Newest kernel that has both modules and an image on disk.
+newest_kver() {
+    for _d in /usr/lib/modules/*/; do
+        [ -f "${_d}vmlinuz" ] || continue
+        _k="${_d%/}"
+        printf '%s\n' "${_k##*/}"
+    done | sort -V | tail -1
+}
+
+# uname-style version directory for an installed pkgbase (linux, linux-lts, …).
+kver_for_pkgbase() {
+    for _p in /usr/lib/modules/*/pkgbase; do
+        [ -r "$_p" ] || continue
+        [ "$(cat "$_p")" = "$1" ] || continue
+        _d="${_p%/pkgbase}"
+        [ -f "$_d/vmlinuz" ] || continue
+        _d="${_d%/}"
+        printf '%s\n' "${_d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# The kernel-install UKI for a version, named <entry-token>-<kver>.efi. If the
+# filename does not match (a custom entry_token, a hand-copied image) read the
+# version out of the PE .uname section, which is authoritative.
+find_uki() {
+    _want="$1"
+    for _f in "$ESP"/EFI/Linux/*"$_want".efi; do
+        [ -f "$_f" ] && { printf '%s\n' "$_f"; return 0; }
+    done
+    command -v objcopy >/dev/null 2>&1 || return 1
+    for _f in "$ESP"/EFI/Linux/*.efi; do
+        [ -f "$_f" ] || continue
+        _u="$(objcopy -O binary --only-section=.uname "$_f" /dev/stdout 2>/dev/null \
+                | tr -d '\0' | tr -d '[:space:]')"
+        [ "$_u" = "$_want" ] && { printf '%s\n' "$_f"; return 0; }
+    done
+    return 1
+}
+
+# --- Which kernel becomes the boot image? ----------------------------------
+# /etc/maze/kernel-default holds the pkgbase the user pinned with the kernel
+# switcher (`maze-kernel-helper set-default`). Honour it.
+#
+# This script used to ignore that file and always take the newest kernel, so
+# installing or updating ANY kernel silently threw the user's choice away — the
+# switcher had to print a "you will have to pin it again" warning after every
+# single set-default. Someone who deliberately ran linux-lts was moved back onto
+# linux by the next update, with no notice at boot.
+#
+# The pin is ADVISORY and can never leave the machine without a boot image: it
+# is honoured only when that kernel is installed AND already has a UKI on the
+# ESP. Anything else falls back to the newest installed kernel and says so.
+PINNED_PKGBASE=""
+if [ -r /etc/maze/kernel-default ]; then
+    PINNED_PKGBASE="$(tr -d '[:space:]' < /etc/maze/kernel-default 2>/dev/null || true)"
+fi
+
+NEWEST_KVER="$(newest_kver)"
+TARGET_KVER=""
+UKI=""
+
+if [ -n "$PINNED_PKGBASE" ]; then
+    TARGET_KVER="$(kver_for_pkgbase "$PINNED_PKGBASE" || true)"
+    if [ -z "$TARGET_KVER" ]; then
+        echo "maze-sb-sign: pinned kernel '$PINNED_PKGBASE' is not installed — using the newest instead" >&2
+    else
+        UKI="$(find_uki "$TARGET_KVER" || true)"
+        if [ -z "$UKI" ]; then
+            echo "maze-sb-sign: pinned kernel '$PINNED_PKGBASE' ($TARGET_KVER) has no UKI on the ESP — using the newest instead" >&2
+            TARGET_KVER=""
+        else
+            echo "maze-sb-sign: boot default pinned to '$PINNED_PKGBASE' ($TARGET_KVER)"
+        fi
+    fi
+fi
+
+if [ -z "$TARGET_KVER" ]; then
+    TARGET_KVER="$NEWEST_KVER"
+    if [ -n "$TARGET_KVER" ]; then
+        UKI="$(find_uki "$TARGET_KVER" || true)"
+    fi
+fi
+
+if [ -z "$TARGET_KVER" ]; then
+    echo "maze-sb-sign: ERROR - no installed kernel found under /usr/lib/modules" >&2
+    status_ok=0
+fi
+
+# --- Remove UKIs whose kernel is no longer installed -----------------------
+# Nothing else on the system does this, so without it every kernel version ever
+# installed leaves a ~90 MB image behind on a 3 GB ESP, and those stale files
+# are exactly what the old mtime rule used to pick. Guarded three ways: there
+# must be an image we are keeping, never the one we are about to install, and
+# only names that parse as a kernel version with no /usr/lib/modules/<kver>
+# directory — so every INSTALLED kernel keeps its UKI (that is what makes a
+# second kernel, and the switcher's pin above, work at all).
+prune_stale_ukis() {
+    [ -n "$UKI" ] || return 0
+    for _f in "$ESP"/EFI/Linux/*.efi; do
+        [ -f "$_f" ] || continue
+        [ "$_f" = "$UKI" ] && continue
+        _b="${_f##*/}"; _b="${_b%.efi}"
+        _kv="${_b#*-}"
+        case "$_kv" in
+            [0-9]*.[0-9]*) ;;
+            *) continue ;;
+        esac
+        [ -d "/usr/lib/modules/$_kv" ] && continue
+        if rm -f "$_f"; then
+            echo "maze-sb-sign: removed stale UKI ${_b}.efi (kernel $_kv is not installed)"
+        fi
+    done
+    # Never leak the loop's last exit status: `set -e` is in force and both call
+    # sites are the final command of an `if` body, which is NOT a protected
+    # context — a stray non-zero here would abort the run before signing.
+    return 0
+}
+
+# Prune BEFORE signing as well as after. The after-only prune meant a run that
+# kept failing could never reclaim the space causing the failure — and a full
+# ESP is the obvious way for sbsign to fail, so the one situation the cleanup
+# existed for was the one where it never ran. Doing it first is safe for exactly
+# the reason the after-prune was: the grubx64.efi already on disk is a
+# self-contained copy of a bootable UKI, so it survives whatever happens next.
+if [ -s "$GRUB" ]; then
+    prune_stale_ukis
+fi
+
+if [ -n "$UKI" ]; then
+    # Sign to a temp file and rename into place — never write $GRUB directly.
+    # sbsign dying partway (disk full, killed mid-transaction) must not leave
+    # a truncated/corrupt grubx64.efi with no working fallback, since it is the
+    # ONLY thing shim chainloads.
+    if sbsign --key "$KEY" --cert "$CRT" --output "$GRUB.maze-signed" "$UKI" 2>/dev/null; then
+        # Keep the OUTGOING image as grubx64.efi.maze-prev. shim chainloads
+        # grubx64.efi and nothing else — there is no systemd-boot menu and the
+        # sd-boot NVRAM entry is deliberately removed — so until now a kernel
+        # that booted badly left no way back except a live USB. This is that way
+        # back (see the recovery note printed at the end of the run).
+        #
+        # Rotate on a KERNEL VERSION change only, tracked in .maze-kver: this
+        # script runs up to three times per kernel upgrade, and rotating on every
+        # run would overwrite the fallback with the very image it is a fallback
+        # for. maze-kernel-helper writes the same marker when it pins a kernel.
+        _prev_kver=""
+        if [ -r "$GRUB.maze-kver" ]; then
+            _prev_kver="$(tr -d '[:space:]' < "$GRUB.maze-kver" 2>/dev/null || true)"
+        fi
+        if [ -s "$GRUB" ] && [ -n "$_prev_kver" ] && [ "$_prev_kver" != "$TARGET_KVER" ]; then
+            if cp -f "$GRUB" "$GRUB.maze-prev" 2>/dev/null; then
+                printf '%s\n' "$_prev_kver" > "$GRUB.maze-prev.kver" 2>/dev/null || true
+                echo "maze-sb-sign: kept kernel $_prev_kver as ${GRUB}.maze-prev (rollback copy)"
+            else
+                # Out of space on the ESP is the realistic failure here. A partial
+                # copy would waste that space AND look like a usable fallback to
+                # whoever finds it later, so remove both it and its stale label.
+                rm -f "$GRUB.maze-prev" "$GRUB.maze-prev.kver" 2>/dev/null || true
+                echo "maze-sb-sign: WARNING - could not keep a rollback copy (ESP full?); continuing" >&2
+            fi
+        fi
+        mv -f "$GRUB.maze-signed" "$GRUB"
+        printf '%s\n' "$TARGET_KVER" > "$GRUB.maze-kver" 2>/dev/null || true
+        sync
+        echo "maze-sb-sign: SIGNED $GRUB (from $UKI, kernel $TARGET_KVER)"
+    else
+        rm -f "$GRUB.maze-signed"
+        echo "maze-sb-sign: FAIL signing $UKI as $GRUB" >&2
+        status_ok=0
+    fi
+elif [ -n "$TARGET_KVER" ]; then
+    # Deliberately NOT falling back to "sign whatever grubx64.efi is already
+    # there" (what this branch used to do): that is what let a dead kernel stay
+    # installed as the boot image while the run still reported success. Leave
+    # the existing chain untouched — it may still be bootable — and fail loudly.
+    echo "maze-sb-sign: ERROR - no UKI on the ESP for the installed kernel $TARGET_KVER" >&2
+    echo "maze-sb-sign:         REFUSING to install a stale grubx64.efi (that is what bricks the boot)." >&2
+    echo "maze-sb-sign:         Rebuild it with:" >&2
+    echo "maze-sb-sign:           kernel-install add $TARGET_KVER /usr/lib/modules/$TARGET_KVER/vmlinuz" >&2
+    status_ok=0
+fi
+
+# Second pass: covers the first-ever run, where there was no grubx64.efi yet for
+# the pre-sign prune to lean on.
+if [ "$status_ok" = 1 ]; then
+    prune_stale_ukis
+fi
+
+# Also sign any loose kernels/UKIs on the ESP as a safety net (in case the
+# firmware boots via a different path). These are NOT the primary boot path —
+# the UKI as grubx64.efi is — but keeping them signed is harmless.
+boot_path="$(bootctl --print-boot-path 2>/dev/null || true)"
+dirs="$ESP"
+for d in "$boot_path" /boot /efi; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    case " $dirs " in *" $d "*) ;; *) dirs="$dirs $d" ;; esac
+done
+# Loose /boot/vmlinuz-<pkgbase> files are written by mkinitcpio's pacman hook
+# on every kernel install/upgrade even though Maze's presets are empty: with
+# layout=uki nothing ever boots them (there are no BLS entries pointing at them),
+# so they are 16 MB of dead weight per kernel that this loop then dutifully
+# signed. Remove them instead — but only in the configuration where they are
+# provably unused: kernel-install layout=uki AND no loader/entries/*.conf on
+# that ESP. Anything else keeps the old behaviour (sign, do not touch).
+_uki_only=0
+grep -qE '^[[:space:]]*layout=uki' /etc/kernel/install.conf 2>/dev/null && _uki_only=1
+for d in $dirs; do
+    if [ "$_uki_only" = 1 ] && ! ls "$d"/loader/entries/*.conf >/dev/null 2>&1; then
+        for f in "$d"/vmlinuz-*; do
+            [ -f "$f" ] || continue
+            rm -f "$f" && echo "maze-sb-sign: removed loose ${f##*/} (unused with layout=uki; the UKI carries the kernel)"
+        done
+    else
+        for f in "$d"/vmlinuz-*; do sign_inplace "$f"; done
+    fi
+    for f in "$d"/EFI/Linux/*.efi "$d"/*/*/linux; do
+        sign_inplace "$f"
+    done
+done
+
+# --- A second, firmware-selectable boot entry for the other kernel ----------
+#
+# THE PROBLEM THIS SOLVES
+#
+# maze-meta installs linux-lts alongside linux precisely so a bad mainline
+# update is not a live-USB recovery. Its UKI is built, its DKMS modules are
+# compiled, and the loop above signs it — and until now none of that could be
+# reached. shim chainloads exactly one file, $ESP/EFI/BOOT/grubx64.efi, there is
+# no boot menu, and firmware cannot load a MOK-signed image directly (shim is
+# what validates MOK, not the firmware db). So the recovery kernel was insurance
+# that could not be cashed.
+#
+# THE FIX
+#
+# shim looks for its second stage in ITS OWN directory. So a second copy of shim
+# in $ESP/EFI/maze-recovery, next to a copy of the other kernel's signed UKI
+# named grubx64.efi, is a complete second chain. MOK enrolment lives in a UEFI
+# variable shared by every shim instance, so nothing has to be re-enrolled.
+#
+# The primary chain is not touched. If anything here fails or the image is
+# corrupt, a normal boot is completely unaffected — which is why every failure
+# below is a warning and never sets status_ok=0.
+
+RECOVERY_DIR="$ESP/EFI/maze-recovery"
+RECOVERY_IMG="$RECOVERY_DIR/grubx64.efi"
+RECOVERY_LABEL="Maze Linux (recovery kernel)"
+
+# The kernel to keep as recovery: linux-lts if it is installed, otherwise any
+# other installed kernel that is not the one we just made the boot default.
+# Never the boot kernel itself — a copy of the image that just broke is not a
+# recovery path.
+recovery_kver() {
+    _lts="$(kver_for_pkgbase linux-lts || true)"
+    if [ -n "$_lts" ] && [ "$_lts" != "$TARGET_KVER" ]; then
+        printf '%s\n' "$_lts"
+        return 0
+    fi
+    for _d in /usr/lib/modules/*/; do
+        [ -f "${_d}vmlinuz" ] || continue
+        _k="${_d%/}"; _k="${_k##*/}"
+        [ "$_k" = "$TARGET_KVER" ] && continue
+        printf '%s\n' "$_k"
+        return 0
+    done
+    return 1
+}
+
+# Free space on the ESP in KiB, or empty when it cannot be read.
+esp_free_kb() {
+    df -Pk "$ESP" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+install_recovery() {
+    _rk="$(recovery_kver || true)"
+    if [ -z "$_rk" ]; then
+        # One kernel installed is a supported configuration, just a thinner one.
+        [ -d "$RECOVERY_DIR" ] && rm -rf "$RECOVERY_DIR"
+        return 0
+    fi
+
+    _ruki="$(find_uki "$_rk" || true)"
+    if [ -z "$_ruki" ]; then
+        echo "maze-sb-sign: WARNING - recovery kernel $_rk has no UKI on the ESP; no recovery entry" >&2
+        return 0
+    fi
+
+    # It has to be signed, or shim refuses it and the entry is a dead end that
+    # only reveals itself the day someone needs it.
+    if ! sbverify --cert "$CRT" "$_ruki" >/dev/null 2>&1; then
+        echo "maze-sb-sign: WARNING - recovery UKI $_ruki is not signed; no recovery entry" >&2
+        return 0
+    fi
+
+    # Already current? Then this run costs nothing. Checked by version marker
+    # first (cheap) and confirmed by content, so a half-written image from an
+    # interrupted run is replaced rather than trusted.
+    _marker="$RECOVERY_DIR/.maze-kver"
+    if [ -s "$RECOVERY_IMG" ] && [ -r "$_marker" ] \
+       && [ "$(tr -d '[:space:]' < "$_marker" 2>/dev/null || true)" = "$_rk" ] \
+       && cmp -s "$_ruki" "$RECOVERY_IMG"; then
+        echo "maze-sb-sign: OK     recovery entry (kernel $_rk)"
+        return 0
+    fi
+
+    # Refuse if the copy cannot fit with room to spare. Filling the ESP is
+    # exactly how the PRIMARY chain fails to be written on the next kernel
+    # update, and a recovery image is never worth that risk — so the headroom
+    # demanded is not just this copy but another whole UKI on top of it, which
+    # is what the next `pacman -Syu` will need. When the ESP is tight the right
+    # outcome is no recovery entry, not a boot that cannot be updated.
+    _uki_kb="$(( $(wc -c < "$_ruki") / 1024 ))"
+    _need_kb="$(( _uki_kb * 2 + 51200 ))"
+    _free_kb="$(esp_free_kb)"
+    if [ -n "$_free_kb" ] && [ "$_free_kb" -lt "$_need_kb" ]; then
+        echo "maze-sb-sign: WARNING - not enough ESP space for a recovery entry" >&2
+        echo "maze-sb-sign:           (need ~$(( _need_kb / 1024 )) MB, have $(( _free_kb / 1024 )) MB)" >&2
+        return 0
+    fi
+
+    mkdir -p "$RECOVERY_DIR" || { echo "maze-sb-sign: WARNING - cannot create $RECOVERY_DIR" >&2; return 0; }
+    install_if_diff "$KEYDIR/shimx64.efi" "$RECOVERY_DIR/BOOTX64.EFI" || true
+    install_if_diff "$KEYDIR/mmx64.efi"   "$RECOVERY_DIR/mmx64.efi"   || true
+
+    # Temp file and rename, for the same reason as grubx64.efi: a truncated
+    # image that looks bootable is worse than no image at all.
+    if cp -f "$_ruki" "$RECOVERY_IMG.new" 2>/dev/null \
+       && mv -f "$RECOVERY_IMG.new" "$RECOVERY_IMG" 2>/dev/null; then
+        printf '%s\n' "$_rk" > "$_marker" 2>/dev/null || true
+        sync
+        echo "maze-sb-sign: SIGNED $RECOVERY_IMG (recovery kernel $_rk)"
+    else
+        rm -f "$RECOVERY_IMG.new"
+        echo "maze-sb-sign: WARNING - could not write the recovery image" >&2
+    fi
+    return 0
+}
+
+# The firmware entry that makes the above selectable. Written ONCE and then only
+# checked: NVRAM has a finite number of writes and some firmware handles churn
+# badly, so this must not run on every kernel update.
+#
+# BootOrder is the dangerous part. `efibootmgr --create` puts the new entry
+# FIRST, which would silently make the recovery kernel the default boot. So the
+# original order is captured, and afterwards restored with the new entry
+# appended at the end — present in the firmware's boot menu, never ahead of the
+# real one.
+ensure_recovery_nvram() {
+    [ -s "$RECOVERY_IMG" ] || return 0
+    command -v efibootmgr >/dev/null 2>&1 || return 0
+    [ -d /sys/firmware/efi/efivars ] || return 0
+
+    if efibootmgr 2>/dev/null | grep -Fq "$RECOVERY_LABEL"; then
+        return 0
+    fi
+
+    # Which disk and partition the ESP lives on.
+    _src="$(findmnt -no SOURCE --target "$ESP" 2>/dev/null || true)"
+    [ -n "$_src" ] || return 0
+    _partn="$(lsblk -no PARTN "$_src" 2>/dev/null | tr -d '[:space:]' || true)"
+    _disk="$(lsblk -no PKNAME "$_src" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+    if [ -z "$_partn" ] || [ -z "$_disk" ]; then
+        echo "maze-sb-sign: WARNING - could not identify the ESP disk; no recovery boot entry" >&2
+        return 0
+    fi
+
+    _before="$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | tr -d '[:space:]' || true)"
+
+    if ! efibootmgr --quiet --create \
+            --disk "/dev/$_disk" --part "$_partn" \
+            --loader '\EFI\maze-recovery\BOOTX64.EFI' \
+            --label "$RECOVERY_LABEL" >/dev/null 2>&1; then
+        echo "maze-sb-sign: WARNING - could not create the recovery boot entry" >&2
+        return 0
+    fi
+
+    # Put the order back, with the new entry last.
+    _after="$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | tr -d '[:space:]' || true)"
+    if [ -n "$_before" ] && [ -n "$_after" ]; then
+        # Everything that was not in the order before is new; it all goes to the
+        # end, in the order the firmware reported it. Written as an accumulator
+        # rather than a single assignment so that more than one new entry cannot
+        # silently drop all but the last.
+        _added=""
+        for _e in $(printf '%s' "$_after" | tr ',' ' '); do
+            case ",$_before," in
+                *",$_e,"*) ;;
+                *) _added="${_added:+$_added,}$_e" ;;
+            esac
+        done
+        _new="$_before${_added:+,$_added}"
+        if [ "$_new" != "$_after" ]; then
+            efibootmgr --quiet --bootorder "$_new" >/dev/null 2>&1 \
+                || echo "maze-sb-sign: WARNING - recovery entry created but BootOrder not restored" >&2
+        fi
+    fi
+    echo "maze-sb-sign: created firmware boot entry \"$RECOVERY_LABEL\""
+    return 0
+}
+
+install_recovery
+ensure_recovery_nvram
+
+if [ "$status_ok" = 1 ]; then
+    # Point at the rollback copy while the user can still read it. It is the only
+    # way back to the previous kernel on a shim -> grubx64.efi chain with no boot
+    # menu, and it is useless if nobody knows it is there.
+    if [ -s "$GRUB.maze-prev" ]; then
+        _pk=""
+        if [ -r "$GRUB.maze-prev.kver" ]; then
+            _pk="$(tr -d '[:space:]' < "$GRUB.maze-prev.kver" 2>/dev/null || true)"
+        fi
+        echo "maze-sb-sign: rollback available${_pk:+ (kernel $_pk)}: restore with"
+        echo "maze-sb-sign:   cp -f ${GRUB}.maze-prev ${GRUB}"
+    fi
+    echo "maze-sb-sign: done (ESP=$ESP)"
+else
+    echo "maze-sb-sign: WARNING - some boot files are NOT validly signed (ESP=$ESP)" >&2
+    exit 1
+fi

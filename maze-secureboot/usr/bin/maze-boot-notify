@@ -1,0 +1,28 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-secureboot).
+# Shows the boot-chain warning to a logged-in desktop user. Started from
+# /etc/xdg/autostart at login; silent when everything is fine.
+set -u
+
+FLAG=/var/lib/maze/boot-unsafe
+[ -e "$FLAG" ] || exit 0
+command -v notify-send >/dev/null 2>&1 || exit 0
+
+body="$(head -n 4 "$FLAG" 2>/dev/null)"
+
+# Critical urgency so the notification stays on screen until dismissed — this is
+# not something to miss while scrolling past a toast.
+notify-send \
+    --urgency=critical \
+    --icon=dialog-error \
+    --app-name="Maze" \
+    "This machine may not start up again" \
+    "Something is wrong with the boot files, so a restart could leave it unable
+to start.
+
+${body}
+
+To repair it, run in a terminal:
+    sudo maze-boot-check --repair
+
+Shutting down is still allowed — the shutdown dialog will ask you to confirm."

@@ -1,0 +1,523 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-secureboot).
+#
+# maze-boot-check — verify the ENTIRE boot chain while the machine is still up,
+# still root, and still fixable.
+#
+# Why this exists: every layer of the Maze Secure Boot stack fails loudly in its
+# own lane, but nothing ever checked the chain END TO END. A machine can pass
+# every individual step and still not boot — the clearest case being a UKI that
+# builds and signs perfectly but carries an initramfs with no `encrypt` hook on
+# a LUKS root. That machine boots, cannot unlock its own disk, and no signer,
+# hook or unit anywhere reports a problem.
+#
+# On failure this writes /var/lib/maze/boot-unsafe. maze-boot-guard reads that
+# flag and holds a shutdown inhibitor, so a broken chain has to be acknowledged
+# before the machine can be rebooted through logind.
+#
+# Usage:
+#   maze-boot-check            check, print a report, set/clear the flag
+#   maze-boot-check --quiet    print only on failure (for timers and hooks)
+#   maze-boot-check --repair   rebuild + re-sign everything, then re-check
+#   maze-boot-check --no-flag  never touch the flag file (read-only inspection)
+#
+# Exit: 0 = chain is sound, 1 = something would prevent or break a boot,
+#       2 = cannot run (not root, no ESP).
+set -u
+
+FLAG_DIR=/var/lib/maze
+FLAG="$FLAG_DIR/boot-unsafe"
+KEYDIR=/var/lib/maze-secureboot
+CRT="$KEYDIR/MOK.crt"
+
+QUIET=0
+REPAIR=0
+USE_FLAG=1
+for arg in "$@"; do
+    case "$arg" in
+        --quiet)   QUIET=1 ;;
+        --repair)  REPAIR=1 ;;
+        --no-flag) USE_FLAG=0 ;;
+        -h|--help) sed -n '4,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-boot-check: unknown option '$arg'" >&2; exit 2 ;;
+    esac
+done
+
+FAILURES=""
+FIXES=""
+report=""
+
+# Buffer the report rather than printing as we go: in --quiet mode a clean run
+# must print nothing at all, and we do not know it is clean until the end.
+say()  { report="${report}$1
+"; }
+ok()   { say "  [ OK ]  $1"; }
+skip() { say "  [ -- ]  $1"; }
+bad() {
+    say "  [FAIL]  $1"
+    [ -n "${2:-}" ] && say "          $2"
+    FAILURES="${FAILURES}$1
+"
+    [ -n "${3:-}" ] && FIXES="${FIXES}$3
+"
+    return 0
+}
+
+flush() {
+    if [ "$QUIET" = 1 ] && [ -z "$FAILURES" ]; then return 0; fi
+    printf '%s' "$report"
+}
+
+# --- environment ------------------------------------------------------------
+
+[ "$(id -u)" -eq 0 ] || { echo "maze-boot-check: must run as root (the ESP is readable by root only)" >&2; exit 2; }
+
+ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+if [ -z "${ESP:-}" ] || [ ! -d "$ESP" ]; then
+    ESP=""
+    for _c in /efi /boot; do
+        if [ -d "$_c/EFI" ]; then ESP="$_c"; break; fi
+    done
+fi
+if [ -z "$ESP" ] || [ ! -d "$ESP/EFI" ]; then
+    echo "maze-boot-check: no ESP found (tried bootctl, /efi, /boot)" >&2
+    exit 2
+fi
+
+if [ "$REPAIR" = 1 ]; then
+    echo ">> maze-boot-check: repairing - rebuilding the UKI for every installed kernel"
+    for _d in /usr/lib/modules/*/; do
+        [ -f "${_d}vmlinuz" ] || continue
+        _k="${_d%/}"; _k="${_k##*/}"
+        kernel-install add "$_k" "${_d}vmlinuz" \
+            || echo ">> WARNING: kernel-install add failed for $_k" >&2
+    done
+    maze-sb-sign --force-bootloader || echo ">> WARNING: signing reported problems" >&2
+    echo
+fi
+
+GRUB="$ESP/EFI/BOOT/grubx64.efi"
+
+# Is this machine actually managed by maze-secureboot? The per-machine MOK key
+# is what the installer generates and everything else hangs off; without it
+# there is no chain to verify.
+#
+# This matters because the packaged hook also runs inside the ISO BUILD chroot,
+# where there is legitimately no ESP, no cmdline and no key. Reporting FAIL
+# there is wrong twice over: it prints an alarming report during every build,
+# and it writes /var/lib/maze/boot-unsafe into the airootfs — which unpackfs
+# then copies onto every installed machine, so a brand-new, perfectly healthy
+# system boots with its shutdown inhibited and a "boot chain is not safe"
+# notification. Say plainly that there is nothing to check, and leave.
+if [ ! -r "$KEYDIR/MOK.key" ]; then
+    if [ "$QUIET" != 1 ]; then
+        echo "maze-boot-check — ESP=$ESP"
+        echo
+        echo "  [ -- ]  No machine MOK key at $KEYDIR/MOK.key."
+        echo "          This system is not managed by maze-secureboot (an ISO build"
+        echo "          chroot, a rescue environment, or an install without Secure"
+        echo "          Boot). There is no boot chain here to verify."
+    fi
+    # Never leave a stale flag behind in an environment that cannot clear it.
+    if [ "$USE_FLAG" = 1 ] && [ -e "$FLAG" ]; then
+        rm -f "$FLAG"
+    fi
+    exit 0
+fi
+
+say "maze-boot-check — ESP=$ESP"
+say ""
+
+# --- 1) installed kernels ---------------------------------------------------
+
+KERNELS=""
+for _d in /usr/lib/modules/*/; do
+    [ -f "${_d}vmlinuz" ] || continue
+    _k="${_d%/}"
+    KERNELS="$KERNELS ${_k##*/}"
+done
+KERNELS="${KERNELS# }"
+
+if [ -z "$KERNELS" ]; then
+    bad "No kernel installed" \
+        "Nothing under /usr/lib/modules carries a vmlinuz." \
+        "sudo pacman -S linux"
+else
+    _n=0
+    for _k in $KERNELS; do _n=$((_n + 1)); done
+    ok "Installed kernels: $KERNELS"
+    if [ "$_n" -lt 2 ]; then
+        skip "Only one kernel installed - no recovery kernel (linux-lts recommended)"
+    fi
+fi
+
+# --- 2) a UKI for every installed kernel ------------------------------------
+
+uki_for() {
+    for _f in "$ESP"/EFI/Linux/*"$1".efi; do
+        if [ -f "$_f" ]; then printf '%s\n' "$_f"; return 0; fi
+    done
+    return 1
+}
+
+for _k in $KERNELS; do
+    if uki_for "$_k" >/dev/null; then
+        ok "UKI present: $_k"
+    else
+        bad "UKI missing: $_k" \
+            "This kernel is installed but has no boot image on the ESP." \
+            "sudo maze-boot-check --repair"
+    fi
+done
+
+# --- 3) grubx64.efi points at a kernel that can actually run ----------------
+# The real killer: pacman deletes /usr/lib/modules/<old> on a kernel upgrade but
+# nothing removes the old UKI, so a boot image for a kernel with no modules on
+# disk boots to "No working init found" with nothing anywhere explaining why.
+
+if [ ! -s "$GRUB" ]; then
+    bad "grubx64.efi is missing or empty" \
+        "shim loads this file and nothing else; without it the machine will not boot." \
+        "sudo maze-boot-check --repair"
+else
+    ok "grubx64.efi present"
+
+    TARGET=""
+    if [ -r "$GRUB.maze-kver" ]; then
+        TARGET="$(tr -d '[:space:]' < "$GRUB.maze-kver" 2>/dev/null || true)"
+    fi
+
+    if [ -z "$TARGET" ]; then
+        skip "No grubx64.efi.maze-kver marker - cannot tell which kernel it carries"
+    elif [ ! -f "/usr/lib/modules/$TARGET/vmlinuz" ]; then
+        bad "Boot image points at a kernel that is not installed: $TARGET" \
+            "Its modules are gone. The machine boots and cannot load a single module." \
+            "sudo maze-boot-check --repair"
+    else
+        ok "Boot image points at an installed kernel: $TARGET"
+
+        # Does grubx64.efi actually CONTAIN this kernel? Read the version out of
+        # its PE .uname section — what the image says about itself.
+        #
+        # This used to compare grubx64.efi byte-for-byte against the UKI in
+        # EFI/Linux, which was simply wrong: maze-sb-sign builds grubx64.efi by
+        # running sbsign OVER that UKI, so whenever the UKI already carries a
+        # signature the two files legitimately differ by a signature layer. The
+        # old test called a perfectly healthy boot chain unsafe, mid-upgrade,
+        # which is the worst possible moment to cry wolf.
+        _guname=""
+        if command -v objcopy >/dev/null 2>&1; then
+            _guname="$(objcopy -O binary --only-section=.uname "$GRUB" /dev/stdout 2>/dev/null \
+                        | tr -d '\0' | tr -d '[:space:]')"
+        fi
+        if [ -n "$_guname" ]; then
+            if [ "$_guname" = "$TARGET" ]; then
+                ok "grubx64.efi really does carry kernel $TARGET"
+            else
+                bad "grubx64.efi carries kernel $_guname, expected $TARGET" \
+                    "The boot image is not the kernel the marker claims." \
+                    "sudo maze-sb-sign --force-bootloader"
+            fi
+        elif _u="$(uki_for "$TARGET")" && cmp -s "$GRUB" "$_u"; then
+            # No .uname (hand-built image) or no objcopy. Byte equality still
+            # PROVES it right; merely differing proves nothing, so that only skips.
+            ok "grubx64.efi is byte-identical to the $TARGET UKI"
+        else
+            skip "Could not read the version inside grubx64.efi (no .uname / no objcopy)"
+        fi
+    fi
+fi
+
+# --- 4) signature -----------------------------------------------------------
+
+if [ ! -r "$CRT" ]; then
+    skip "No MOK certificate - this machine was not set up for Secure Boot"
+elif [ ! -s "$GRUB" ]; then
+    : # already reported above
+elif ! command -v sbverify >/dev/null 2>&1; then
+    skip "sbverify missing - signature not checked (pacman -S sbsigntools)"
+elif sbverify --cert "$CRT" "$GRUB" >/dev/null 2>&1; then
+    ok "grubx64.efi is signed with the machine MOK key"
+else
+    bad "grubx64.efi signature does not verify" \
+        "With Secure Boot enabled the firmware will reject this image." \
+        "sudo maze-sb-sign --force-bootloader"
+fi
+
+# --- 5) shim ----------------------------------------------------------------
+
+SHIM="$ESP/EFI/BOOT/BOOTX64.EFI"
+if [ ! -r "$CRT" ]; then
+    :
+elif [ ! -s "$SHIM" ]; then
+    bad "shim missing: $SHIM" \
+        "The first link of the Secure Boot chain is gone." \
+        "sudo maze-sb-sign --force-bootloader"
+elif [ -r "$KEYDIR/shimx64.efi" ] && ! cmp -s "$KEYDIR/shimx64.efi" "$SHIM"; then
+    bad "BOOTX64.EFI is not the expected shim binary" \
+        "'bootctl update' may have overwritten it with an unsigned systemd-boot." \
+        "sudo maze-sb-sign --force-bootloader"
+else
+    ok "shim in place (BOOTX64.EFI)"
+fi
+
+# --- 6) MOK enrolled, if Secure Boot is actually on -------------------------
+
+if ! command -v mokutil >/dev/null 2>&1; then
+    skip "mokutil missing - could not read the Secure Boot state"
+elif ! mokutil --sb-state 2>/dev/null | grep -qi 'secureboot[[:space:]]*enabled'; then
+    skip "Secure Boot is off in firmware - signatures are not required"
+elif [ ! -r "$KEYDIR/MOK.cer" ]; then
+    skip "No MOK.cer - enrolment state not verified"
+elif mokutil --test-key "$KEYDIR/MOK.cer" 2>/dev/null | grep -qi 'already enrolled'; then
+    ok "Secure Boot is on and the machine key is enrolled"
+else
+    bad "Secure Boot is on but the MOK is not enrolled" \
+        "The firmware will not trust the signed image; boot lands in MokManager." \
+        "sudo mokutil --import $KEYDIR/MOK.cer   (then reboot and pick 'Enroll key from disk')"
+fi
+
+# --- 7) LUKS: can the initramfs actually unlock the root? -------------------
+# A UKI that builds and signs perfectly but has no `encrypt` hook produces a
+# machine that boots and then cannot open its own disk. Nothing else in the
+# stack looks at this.
+#
+# The authoritative test would read the initramfs back out of the UKI, but that
+# means decompressing ~90 MB of concatenated early-cpio + zstd on every run,
+# which is slow and brittle. The CONFIGURATION is what actually drifts, so that
+# is what we verify — cheap, deterministic, and it catches the real cause.
+
+CMDLINE_FILE=/etc/kernel/cmdline
+if [ ! -r "$CMDLINE_FILE" ]; then
+    bad "/etc/kernel/cmdline is missing" \
+        "This is where the kernel command line comes from when the UKI is built." \
+        "Restore the cmdline from the install, then: sudo maze-boot-check --repair"
+elif grep -q 'cryptdevice=\|rd.luks' "$CMDLINE_FILE" 2>/dev/null; then
+    _hooks="$(sed -n 's/^[[:space:]]*HOOKS=[(]\(.*\)[)].*/\1/p' /etc/mkinitcpio.conf 2>/dev/null)"
+    case " $_hooks " in
+        *" encrypt "*|*" sd-encrypt "*)
+            ok "LUKS root: the encrypt hook is configured in the initramfs" ;;
+        *)
+            bad "Root is LUKS but mkinitcpio HOOKS has no encrypt hook" \
+                "The machine boots, cannot unlock its disk, and never asks for the passphrase." \
+                "Add 'encrypt' to HOOKS in /etc/mkinitcpio.conf, then: sudo maze-boot-check --repair" ;;
+    esac
+else
+    skip "Root is not encrypted - encrypt hook not required"
+fi
+
+# --- 8) do the cmdline's devices actually exist? ----------------------------
+
+if [ -r "$CMDLINE_FILE" ]; then
+    _missing=""
+    for _uuid in $(tr ' ' '\n' < "$CMDLINE_FILE" \
+                    | sed -n 's/.*UUID=\([0-9a-fA-F-]\{36\}\).*/\1/p' | sort -u); do
+        [ -e "/dev/disk/by-uuid/$_uuid" ] || _missing="$_missing $_uuid"
+    done
+    if [ -n "$_missing" ]; then
+        bad "UUIDs in the cmdline do not exist on this machine:$_missing" \
+            "If a disk was replaced or reformatted, boot will not find the root." \
+            "Fix /etc/kernel/cmdline, then: sudo maze-boot-check --repair"
+    else
+        ok "Every UUID in the cmdline resolves to a present device"
+    fi
+fi
+
+# --- 8b) btrfs: does the root the cmdline implies actually exist? -----------
+# maze-enable-rollback removes `rootflags=subvol=` so that btrfs mounts its
+# DEFAULT subvolume — which is what `snapper rollback` changes, and the only way
+# rollback can work while the cmdline stays sealed in a signed UKI.
+#
+# The failure mode that creates is silent and total: if the default points at
+# the filesystem root (subvolid 5) instead of a real root subvolume, btrfs
+# mounts a tree with no /usr and the initramfs finds no init. Nothing else in
+# this script would notice, because every signature and every image is fine.
+
+if [ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] && command -v btrfs >/dev/null 2>&1; then
+    _cur_id="$(findmnt -no OPTIONS / | tr ',' '\n' | sed -n 's/^subvolid=//p')"
+    _def_id="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
+    if grep -qs 'rootflags=[^ ]*subvol=' "$CMDLINE_FILE"; then
+        skip "Root subvolume is pinned in the cmdline - snapper rollback will NOT take effect (see maze-enable-rollback)"
+    elif [ -z "$_def_id" ] || [ -z "$_cur_id" ]; then
+        skip "Could not read the btrfs default subvolume"
+    elif [ "$_def_id" = "$_cur_id" ]; then
+        ok "btrfs default subvolume is the running root ($_cur_id) - rollback works"
+    else
+        bad "btrfs default subvolume is $_def_id, but / is running from $_cur_id" \
+            "Nothing pins the subvolume in the cmdline, so the next boot mounts the wrong tree." \
+            "sudo btrfs subvolume set-default $_cur_id /"
+    fi
+fi
+
+# --- 9) layout=uki still in force -------------------------------------------
+
+if [ ! -r "$CRT" ]; then
+    :
+elif grep -qs '^[[:space:]]*layout[[:space:]]*=[[:space:]]*uki' /etc/kernel/install.conf; then
+    ok "kernel-install layout=uki"
+else
+    bad "/etc/kernel/install.conf does not set 'layout=uki'" \
+        "Without it kernel updates build no UKI and never reach the boot chain." \
+        "echo layout=uki | sudo tee -a /etc/kernel/install.conf"
+fi
+
+# --- 10) ESP headroom -------------------------------------------------------
+# A full ESP is the realistic way signing fails, and it fails at exactly the
+# moment a new kernel needs its image written.
+
+_avail="$(df -Pk "$ESP" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -n "${_avail:-}" ]; then
+    _biggest=0
+    for _f in "$ESP"/EFI/Linux/*.efi; do
+        [ -f "$_f" ] || continue
+        _s=$(( $(wc -c < "$_f") / 1024 ))
+        [ "$_s" -gt "$_biggest" ] && _biggest="$_s"
+    done
+    [ "$_biggest" -eq 0 ] && _biggest=102400   # assume ~100 MB when nothing to measure
+    if [ "$_avail" -lt "$_biggest" ]; then
+        bad "Not enough room on the ESP for the next UKI ($((_avail / 1024)) MB free, ~$((_biggest / 1024)) MB needed)" \
+            "The next kernel update will not be able to write its image." \
+            "sudo maze-sb-sign --force-bootloader   (prunes UKIs no kernel uses)"
+    else
+        ok "ESP has enough free space ($((_avail / 1024)) MB)"
+    fi
+fi
+
+# --- 11) nothing shadowing the packaged hooks/units -------------------------
+# An old installer, a restored backup or a hand-edit can drop a copy back into
+# /etc, which silently overrides the packaged one and freezes this machine on
+# whatever that copy happens to do.
+
+_shadow=""
+for _f in /etc/pacman.d/hooks/85-maze-kernel-install.hook \
+          /etc/pacman.d/hooks/zz-maze-secureboot.hook \
+          /etc/pacman.d/hooks/zzz-maze-boot-verify.hook \
+          /etc/kernel/install.d/95-maze-sb-sign.install \
+          /etc/systemd/system/maze-sb-resign.service \
+          /etc/systemd/system/maze-sb-resign.path \
+          /etc/systemd/system/maze-boot-guard.service \
+          /etc/systemd/system/maze-boot-guard.path \
+          /etc/systemd/system/maze-boot-check.service \
+          /etc/systemd/system/maze-boot-check.timer \
+          /etc/systemd/system/emergency.service.d/10-maze-sulogin.conf \
+          /etc/systemd/system/rescue.service.d/10-maze-sulogin.conf \
+          /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf; do
+    # This list used to stop at the signer's own units — the ones that BUILD the
+    # chain. It missed every unit that WATCHES it: an empty override at
+    # maze-boot-guard.service silences the shutdown inhibitor entirely, and one
+    # at maze-boot-check.timer stops the daily re-check, with nothing in this
+    # very check catching either — the one job section 11 exists to do.
+    [ -e "$_f" ] && _shadow="$_shadow $_f"
+done
+if [ -n "$_shadow" ]; then
+    bad "Copies shadowing the packaged files:$_shadow" \
+        "They belong to no package, so no update will ever replace them." \
+        "sudo rm$_shadow && sudo pacman -S --needed maze-secureboot"
+else
+    ok "Packaged hooks and units are not shadowed"
+fi
+
+# --- 12) is there a way back if the boot kernel fails? -----------------------
+# maze-meta installs a second kernel so a bad update is not a live-USB job, but
+# shim chainloads exactly one image and firmware cannot load a MOK-signed file
+# on its own. maze-sb-sign therefore keeps a second shim + signed UKI under
+# EFI/maze-recovery and a firmware entry pointing at it. Without both halves the
+# second kernel exists on disk and cannot be reached, which is the same as not
+# having one — so this is a warning about recoverability, never a boot failure.
+
+_reco_dir="$ESP/EFI/maze-recovery"
+_reco_img="$_reco_dir/grubx64.efi"
+_reco_shim="$_reco_dir/BOOTX64.EFI"
+
+_kernels_n=0
+for _d in /usr/lib/modules/*/; do
+    [ -f "${_d}vmlinuz" ] && _kernels_n=$((_kernels_n + 1))
+done
+
+if [ "$_kernels_n" -lt 2 ]; then
+    skip "Only one kernel installed - no recovery entry to check"
+    say "          A second kernel is the cheapest insurance there is:"
+    say "            sudo pacman -S linux-lts linux-lts-headers"
+elif [ ! -s "$_reco_img" ] || [ ! -s "$_reco_shim" ]; then
+    skip "No recovery boot entry - the second kernel cannot be selected at boot"
+    say "          Create it with:  sudo maze-sb-sign"
+else
+    _rk=""
+    if [ -r "$_reco_dir/.maze-kver" ]; then
+        _rk="$(tr -d '[:space:]' < "$_reco_dir/.maze-kver" 2>/dev/null || true)"
+    fi
+    if [ -n "$_rk" ] && [ ! -d "/usr/lib/modules/$_rk" ]; then
+        # Same class of bug as a stale grubx64.efi: an image whose modules were
+        # deleted boots and then cannot load a single driver.
+        bad "Recovery image is for kernel $_rk, which is no longer installed" \
+            "Selecting it would boot a kernel with no modules." \
+            "sudo maze-sb-sign"
+    elif ! sbverify --cert "$CRT" "$_reco_img" >/dev/null 2>&1; then
+        bad "Recovery image is not signed with the machine MOK key" \
+            "shim would refuse it, so the entry is a dead end." \
+            "sudo maze-sb-sign"
+    elif ! command -v efibootmgr >/dev/null 2>&1 || [ ! -d /sys/firmware/efi/efivars ]; then
+        # The image is good but the firmware entry cannot be read from here.
+        # Saying "selectable from the boot menu" without having looked would be
+        # claiming something unverified — the exact habit the rest of this
+        # script exists to avoid.
+        ok "Recovery image is ready${_rk:+ (kernel $_rk)}"
+        say "          Could not read the firmware boot entries to confirm it is listed."
+    elif ! efibootmgr 2>/dev/null | grep -Fq "Maze Linux (recovery kernel)"; then
+        skip "Recovery image is ready but has no firmware boot entry"
+        say "          The files are in place; only the NVRAM entry is missing."
+        say "          Add it with:  sudo maze-sb-sign"
+    else
+        ok "Recovery entry present${_rk:+ (kernel $_rk)} - selectable from the firmware boot menu"
+    fi
+fi
+
+# --- verdict ----------------------------------------------------------------
+
+say ""
+if [ -z "$FAILURES" ]; then
+    say "Result: the boot chain is sound. Rebooting is safe."
+    flush
+    if [ "$USE_FLAG" = 1 ] && [ -e "$FLAG" ]; then
+        rm -f "$FLAG"
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl stop maze-boot-guard.service >/dev/null 2>&1 || true
+        fi
+    fi
+    exit 0
+fi
+
+say "Result: THE BOOT CHAIN IS NOT SAFE"
+say "Rebooting could leave this machine unable to start."
+say ""
+say "How to fix:"
+flush
+# Printed straight out rather than buffered: de-duplicating needs a pipeline,
+# and a pipeline's subshell cannot write back into $report. No temp file, so
+# nothing to race or clean up.
+printf '%s' "$FIXES" | sort -u | sed '/^$/d; s/^/  /'
+echo
+
+if [ "$USE_FLAG" = 1 ]; then
+    mkdir -p "$FLAG_DIR" 2>/dev/null || true
+    printf '%s' "$FAILURES" > "$FLAG" 2>/dev/null || true
+    # The whole protective mechanism is the flag: maze-boot-guard.path exists
+    # only to notice this file and hold a shutdown inhibitor. `|| true` above
+    # means a write failure here (a read-only /var, a full disk — the same
+    # disk this whole check exists to warn about) was silently indistinguishable
+    # from success: the terminal report says "THE BOOT CHAIN IS NOT SAFE" and
+    # exits 1, but nothing stops a reboot through logind, because there is no
+    # flag for the guard to see. A check whose own safety net can fail silently
+    # is not the fail-loud tool the rest of this script is written to be —
+    # verified the same way maze-boot-entries verifies its backup: by reading
+    # the file back, not by trusting the redirection's exit status.
+    if [ ! -s "$FLAG" ]; then
+        echo "maze-boot-check: WARNING - could not write $FLAG" >&2
+        echo "maze-boot-check:           the shutdown inhibitor will NOT engage for this failure." >&2
+        echo "maze-boot-check:           do not reboot until the problems above are fixed." >&2
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl start --no-block maze-boot-guard.service >/dev/null 2>&1 || true
+    fi
+fi
+exit 1

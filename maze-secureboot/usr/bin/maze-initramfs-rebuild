@@ -1,0 +1,118 @@
+#!/bin/sh
+# Managed by Maze Linux. Rebuilds the initramfs AND the Unified Kernel Image for
+# every installed kernel, re-signs the shim chain, and reads the result back out
+# of the signed binary.
+#
+# THIS IS THE COMMAND TO RUN after editing /etc/mkinitcpio.conf,
+# /etc/mkinitcpio.conf.d/*.conf or /etc/kernel/cmdline.
+#
+# WHY `mkinitcpio -P` IS NOT THAT COMMAND
+# ---------------------------------------
+# It is not broken, it is deliberately inert. /etc/kernel/install.conf ships
+# layout=uki, so the artifact the firmware loads is
+# $ESP/EFI/Linux/<machine-id>-<kver>.efi — built by `kernel-install add` and
+# installed by maze-sb-sign as EFI/BOOT/grubx64.efi. The mkinitcpio presets are
+# emptied (PRESETS=()) at install time for two independent reasons:
+#
+#   * a normal preset writes loose /boot/initramfs-*.img that NOTHING on this
+#     system boots, and /boot IS the FAT32 ESP here — 250-400 MB burned on
+#     every kernel update for files no firmware ever reads;
+#   * its ALL_kver="/boot/vmlinuz-<pkgbase>" does not exist on a UKI system, and
+#     mkinitcpio does not skip a preset it cannot satisfy — it aborts the whole
+#     run with exit 1. That took the installation itself down the day linux-lts
+#     was added as the recovery kernel.
+#
+# So `mkinitcpio -P` exits 0 having done nothing. That is safe but SILENT, and
+# silence after a boot-critical edit reads exactly like success: you edit the
+# cmdline, run the command every Arch user reflexively runs, see two warnings,
+# reboot — and nothing has changed. This script is the visible replacement.
+set -eu
+
+SELF=maze-initramfs-rebuild
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "$SELF: must be run as root (try: sudo $SELF)" >&2
+    exit 1
+fi
+
+if ! command -v kernel-install >/dev/null 2>&1; then
+    echo "$SELF: kernel-install not found — the 'systemd' package provides it" >&2
+    exit 1
+fi
+
+rc=0
+found=0
+
+# Enumerate kernels the way the rest of Maze does: a directory under
+# /usr/lib/modules is a real installed kernel only if it carries `pkgbase`.
+# Bare /usr/lib/modules/<ver>/ trees also exist for kernels whose package was
+# removed but whose out-of-tree DKMS modules were left behind, and feeding one
+# of those to kernel-install produces a UKI for a kernel that is not installed.
+for d in /usr/lib/modules/*/; do
+    [ -f "${d}pkgbase" ] || continue
+    kver="${d%/}"; kver="${kver##*/}"
+    if [ ! -f "${d}vmlinuz" ]; then
+        echo "$SELF: WARNING - ${kver} has a pkgbase but no vmlinuz, skipping" >&2
+        continue
+    fi
+    found=$((found + 1))
+    echo "$SELF: rebuilding initramfs + UKI for ${kver}"
+    if ! kernel-install add "$kver" "${d}vmlinuz"; then
+        rc=1
+        echo "$SELF: ERROR - kernel-install add FAILED for ${kver}" >&2
+    fi
+done
+
+if [ "$found" -eq 0 ]; then
+    echo "$SELF: ERROR - no installed kernel found under /usr/lib/modules" >&2
+    exit 1
+fi
+
+# kernel-install's own 95-maze-sb-sign.install plugin already invoked the signer,
+# but it does so with output discarded and `|| true` — by design, so a signing
+# failure can never abort a kernel upgrade mid-transaction. That is the right
+# trade-off there and the wrong one here: the whole point of running this by
+# hand is to SEE whether it worked. Run it again, visibly. maze-sb-sign is
+# idempotent and takes its own lock, so the second run is free.
+if command -v maze-sb-sign >/dev/null 2>&1; then
+    echo "$SELF: signing the boot chain"
+    if ! maze-sb-sign --force-bootloader; then
+        rc=1
+        echo "$SELF: ERROR - maze-sb-sign reported problems" >&2
+    fi
+else
+    echo "$SELF: NOTE - maze-sb-sign not found; boot chain left unsigned" >&2
+fi
+
+# Read the cmdline back out of the PE file the firmware actually chainloads.
+# Anything short of this is guesswork: an edit to /etc/kernel/cmdline only takes
+# effect if it survived into THIS binary, and under Secure Boot there is no boot
+# menu to check it from — the cmdline is baked in and signed.
+ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+[ -n "${ESP:-}" ] && [ -d "$ESP" ] || ESP=/efi
+[ -d "$ESP" ] || ESP=/boot
+BOOTX="$ESP/EFI/BOOT/grubx64.efi"
+if [ -f "$BOOTX" ] && command -v objcopy >/dev/null 2>&1; then
+    # .cmdline is stored NUL-padded; strip the padding so it prints as one line.
+    cmdline="$(objcopy -O binary --only-section=.cmdline "$BOOTX" /dev/stdout 2>/dev/null | tr -d '\000' || true)"
+    if [ -n "$cmdline" ]; then
+        echo "$SELF: cmdline now baked into ${BOOTX}:"
+        echo "    ${cmdline}"
+    else
+        echo "$SELF: WARNING - could not read a .cmdline section from ${BOOTX}" >&2
+    fi
+fi
+
+if [ "$rc" -ne 0 ]; then
+    echo "$SELF: FINISHED WITH ERRORS — do NOT reboot until the errors above are resolved." >&2
+    echo "$SELF:   Check with: sudo maze-boot-check" >&2
+    exit "$rc"
+fi
+
+# Deliberately does not claim "and signed". maze-sb-sign exits 0 both when it
+# signed everything and when it found no MOK key and skipped (the correct result
+# on a machine not using Secure Boot), and those are indistinguishable from its
+# exit code. Its own output above says which happened; claiming it here would be
+# a guess, and a wrong one on every non-Secure-Boot install.
+echo "$SELF: done — ${found} kernel(s) rebuilt. See the signer output above."
+exit 0

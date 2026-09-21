@@ -1,0 +1,20 @@
+[Unit]
+Description=Watch for regenerated kernels/UKIs and re-sign them (Maze Secure Boot)
+
+[Path]
+# Every `kernel-install add` (layout=uki) writes the UKI straight to
+# $ESP/EFI/Linux/<machine-id>-<kver>.efi, so watching that directory reliably
+# catches an out-of-band kernel write (manual reinstall-kernels / kernel-install
+# with no pacman transaction) — whereas watching /boot itself does NOT, since
+# adding a file under a sub-directory leaves /boot's own mtime untouched. The
+# loader/entries paths are kept as a defensive fallback in case layout ever
+# reverts to bls. Both ESP mount points (/boot and /efi) are listed; systemd
+# waits for whichever exists.
+PathChanged=/boot/loader/entries
+PathChanged=/efi/loader/entries
+PathChanged=/boot/EFI/Linux
+PathChanged=/efi/EFI/Linux
+Unit=maze-sb-resign.service
+
+[Install]
+WantedBy=paths.target

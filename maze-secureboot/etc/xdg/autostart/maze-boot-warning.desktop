@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Maze boot check warning
+Comment=Warns at login when the Secure Boot chain would not survive a reboot
+Exec=/usr/bin/maze-boot-notify
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

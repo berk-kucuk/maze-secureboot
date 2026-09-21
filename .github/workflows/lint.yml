@@ -1,0 +1,81 @@
+name: Lint
+
+# The scripts in this repository run as /bin/sh, not bash, and they run at the
+# one moment where a failure is expensive: inside a pacman transaction that is
+# rebuilding the boot image. A bashism here does not fail on this machine (where
+# /bin/sh is bash) — it fails on a machine where /bin/sh is dash, in a hook, on
+# a kernel upgrade. That is exactly the class of bug this catches.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect scripts by interpreter
+        shell: bash
+        run: |
+          : > /tmp/posix.txt
+          : > /tmp/bash.txt
+          while IFS= read -r f; do
+            head -1 "$f" | grep -q '^#!.*/bin/sh'          && { echo "$f" >> /tmp/posix.txt; continue; }
+            head -1 "$f" | grep -qE '^#!.*(bash|env bash)' && echo "$f" >> /tmp/bash.txt
+          done < <(find . -type f \( -perm -u+x -o -name '*.sh' -o -name '*.install' \) -not -path './.git/*')
+          echo "POSIX sh:"; cat /tmp/posix.txt
+          echo "bash:";     cat /tmp/bash.txt
+
+      - name: sh -n / bash -n (syntax)
+        shell: bash
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            sh -n "$f" || { echo "::error file=$f::sh syntax error"; fail=1; }
+          done < /tmp/posix.txt
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done < /tmp/bash.txt
+          # PKGBUILD and the pacman scriptlet are sourced by bash.
+          for f in PKGBUILD *.install; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done
+          exit "$fail"
+
+      - name: shellcheck
+        shell: bash
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          fail=0
+          # -s sh is the point: it rejects bashisms the local /bin/sh would accept.
+          while IFS= read -r f; do
+            shellcheck -s sh -e SC2086,SC2317 "$f" || fail=1
+          done < /tmp/posix.txt
+          while IFS= read -r f; do
+            shellcheck -s bash -e SC2086 "$f" || fail=1
+          done < /tmp/bash.txt
+          exit "$fail"
+
+      - name: hook and unit files are well-formed
+        shell: bash
+        run: |
+          fail=0
+          for f in maze-secureboot/usr/share/libalpm/hooks/*.hook; do
+            grep -q '^\[Trigger\]' "$f" || { echo "::error file=$f::no [Trigger]"; fail=1; }
+            grep -q '^\[Action\]'  "$f" || { echo "::error file=$f::no [Action]";  fail=1; }
+            # Every Exec must point at a path this package actually ships.
+            while IFS= read -r p; do
+              [ -e "maze-secureboot${p}" ] || { echo "::error file=$f::Exec target $p is not shipped"; fail=1; }
+            done < <(sed -n 's/^Exec *= *\(\/[^ ]*\).*/\1/p' "$f")
+          done
+          for f in maze-secureboot/usr/lib/systemd/system/*; do
+            [ -f "$f" ] || continue
+            grep -q '^\[Unit\]' "$f" || { echo "::error file=$f::no [Unit]"; fail=1; }
+          done
+          exit "$fail"

@@ -1,0 +1,246 @@
+# maze-secureboot.install — take ownership of the Secure Boot chain on machines
+# that were installed BEFORE this package existed.
+#
+# Those machines got the same scripts, hooks, kernel-install plugin and systemd
+# units written straight onto the filesystem by the installer, at paths that
+# SHADOW the packaged ones:
+#
+#   /usr/local/bin/maze-sb-sign                        -> /usr/bin/maze-sb-sign
+#   /usr/local/bin/maze-kernel-install-add             -> /usr/bin/maze-kernel-install-add
+#   /etc/pacman.d/hooks/85-maze-kernel-install.hook    -> /usr/share/libalpm/hooks/…
+#   /etc/pacman.d/hooks/zz-maze-secureboot.hook        -> /usr/share/libalpm/hooks/…
+#   /etc/kernel/install.d/95-maze-sb-sign.install      -> /usr/lib/kernel/install.d/…
+#   /etc/systemd/system/maze-sb-resign.{service,path}  -> /usr/lib/systemd/system/…
+#   /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf
+#
+# pacman never sees a file conflict (the packaged paths are all different), so
+# without this scriptlet BOTH copies would exist and the unowned /etc + /usr/local
+# ones would keep winning — the package would install and change nothing. Worse,
+# the shipped update would look applied while the machine still ran the old code.
+#
+# So: delete the shadowing copies, and leave an exec shim at each old
+# /usr/local/bin path. The shims matter for one specific window — pacman has
+# already read the hook directories when this scriptlet runs, so the OLD hooks
+# can still fire once, at PostTransaction of this very transaction, pointing at
+# /usr/local/bin. Without the shims that run would fail; if the same `pacman -Syu`
+# also upgraded the kernel, it would fail at exactly the moment the UKI needed
+# rebuilding. With them, every path leads to the packaged implementation.
+
+_OLD_HOOKS="/etc/pacman.d/hooks/85-maze-kernel-install.hook
+/etc/pacman.d/hooks/zz-maze-secureboot.hook
+/etc/pacman.d/hooks/95-maze-secureboot.hook"
+
+_OLD_UNITS="maze-sb-resign.service maze-sb-resign.path"
+
+# Everything the preset enables. Kept separate from _OLD_UNITS, which is only
+# about the /etc copies an old installer left behind.
+_UNITS="maze-sb-resign.service maze-sb-resign.path maze-boot-guard.path maze-boot-check.timer"
+
+_SHIM_MARK="# maze-secureboot-compat-shim"
+
+_install_shim() {
+    # $1 = old /usr/local/bin path, $2 = packaged /usr/bin target.
+    # Only ever replaces a file that is ALREADY there: a machine installed from
+    # a new ISO has nothing at the old path and gets no shim.
+    [ -e "$1" ] || return 0
+    cat > "$1" <<SHIM
+#!/bin/sh
+$_SHIM_MARK
+# The installer used to write the real script here. It is now shipped by the
+# maze-secureboot package at $2; this shim only keeps stale absolute references
+# (old pacman hooks, old systemd units, local scripts) working.
+exec $2 "\$@"
+SHIM
+    chmod 755 "$1" 2>/dev/null || true
+    echo ">> maze-secureboot: $1 is now a shim for $2"
+}
+
+_migrate() {
+    _install_shim /usr/local/bin/maze-sb-sign            /usr/bin/maze-sb-sign
+    _install_shim /usr/local/bin/maze-kernel-install-add /usr/bin/maze-kernel-install-add
+
+    local h
+    for h in $_OLD_HOOKS; do
+        if [ -e "$h" ]; then
+            rm -f "$h" && echo ">> maze-secureboot: removed shadowing hook $h"
+        fi
+    done
+
+    if [ -e /etc/kernel/install.d/95-maze-sb-sign.install ]; then
+        rm -f /etc/kernel/install.d/95-maze-sb-sign.install \
+            && echo ">> maze-secureboot: removed shadowing kernel-install plugin /etc/kernel/install.d/95-maze-sb-sign.install"
+    fi
+
+    if [ -e /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf ]; then
+        rm -f /etc/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf \
+            && echo ">> maze-secureboot: removed shadowing drop-in 99-maze-resign.conf"
+        rmdir --ignore-fail-on-non-empty /etc/systemd/system/systemd-boot-update.service.d 2>/dev/null || true
+    fi
+
+    # Unit files first, then the enablement symlinks that pointed AT them —
+    # leaving those behind would make systemd report the units as dangling and
+    # `systemctl enable` below would be re-pointing a broken link.
+    local u l
+    for u in $_OLD_UNITS; do
+        [ -e "/etc/systemd/system/$u" ] || continue
+        rm -f "/etc/systemd/system/$u" && echo ">> maze-secureboot: removed shadowing unit /etc/systemd/system/$u"
+    done
+    for l in /etc/systemd/system/*.wants/maze-sb-resign.service \
+             /etc/systemd/system/*.wants/maze-sb-resign.path; do
+        [ -L "$l" ] || continue
+        [ -e "$l" ] && continue        # still resolves (points at /usr/lib) — keep it
+        rm -f "$l" && echo ">> maze-secureboot: dropped dangling enablement symlink $l"
+    done
+}
+
+_enable_units() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # An older Maze install MASKED this to stop `bootctl update` overwriting the
+    # shim; the shipped drop-in repairs the chain instead, so unmask it or
+    # systemd-boot can never be updated again.
+    systemctl unmask systemd-boot-update.service >/dev/null 2>&1 || true
+    systemctl preset $_UNITS >/dev/null 2>&1 || \
+        systemctl enable $_UNITS >/dev/null 2>&1 || true
+    # `enable` only writes the symlinks — it does not START anything. On a live
+    # system that leaves the watchers dormant until the next boot: nothing would
+    # notice a drifting boot chain, and the shutdown guard could not arm itself
+    # even with the flag raised. The whole point is protection that works NOW,
+    # right after the upgrade that might have broken something.
+    if [ -d /run/systemd/system ]; then
+        systemctl start maze-sb-resign.path maze-boot-guard.path maze-boot-check.timer \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+# layout=uki is what makes `kernel-install add` produce the UKI that everything
+# here signs. It ships in /etc (from the ISO overlay), is admin-editable and is
+# owned by no package, so it can drift. Without it a kernel update writes plain
+# BLS artifacts, no UKI is ever built, and maze-sb-sign correctly refuses to
+# install a stale grubx64.efi — i.e. the machine stops tracking new kernels.
+# Report it rather than silently rewriting the admin's boot configuration.
+_check_layout() {
+    [ -r /var/lib/maze-secureboot/MOK.key ] || return 0
+    if ! grep -qs '^[[:space:]]*layout[[:space:]]*=[[:space:]]*uki' /etc/kernel/install.conf; then
+        echo ">> maze-secureboot: WARNING - /etc/kernel/install.conf does not set 'layout=uki'."
+        echo ">>   This machine has a Secure Boot MOK key, so it boots shim -> UKI."
+        echo ">>   Without layout=uki no UKI is built and kernel updates will NOT reach the boot chain."
+        echo ">>   Fix with:  echo layout=uki | sudo tee -a /etc/kernel/install.conf"
+    fi
+}
+
+# `mkinitcpio -P` is deliberately inert on a layout=uki system — the installer
+# empties the presets (see calamares-mount-api.sh) because loose initramfs images
+# nothing boots would burn 250-400 MB of the FAT32 ESP per kernel update, and
+# because their ALL_kver path does not exist here, which makes mkinitcpio abort
+# the whole run with exit 1 instead of skipping.
+#
+# Inert is right. SILENT is not: the command exits 0 printing only "Preset file
+# is empty", which after an edit to mkinitcpio.conf or /etc/kernel/cmdline reads
+# exactly like success — the admin reboots believing a change is live when the
+# UKI was never rebuilt. mkinitcpio SOURCES preset files, so a notice appended
+# here actually runs and can name the command that does work.
+#
+# It has to happen from this scriptlet rather than by shipping a file: the
+# presets belong to the KERNEL packages (they are in linux/linux-lts's backup
+# array), so no update to this package can ever replace them on an already
+# installed machine — the exact reachability problem this package exists to fix.
+#
+# Only ever touches a preset that ALREADY carries PRESETS=(), i.e. one Maze
+# wrote. A stock preset, or one an admin has deliberately restored, is left
+# completely alone. Idempotent via the MAZE_PRESET_NOTICE marker.
+_add_preset_notice() {
+    for preset in /etc/mkinitcpio.d/*.preset; do
+        [ -f "$preset" ] || continue
+        # Match on the payload, not on a marker comment. A freshly installed
+        # machine already has this notice — written by calamares-mount-api.sh in
+        # its own wording — and grepping for a marker only THIS function writes
+        # would append a second, duplicate copy on the very first post_install.
+        # The command name is the one string both versions are guaranteed to
+        # carry, and it is the thing being advertised.
+        if grep -q 'maze-initramfs-rebuild' "$preset" 2>/dev/null; then
+            continue
+        fi
+        if ! grep -qE '^[[:space:]]*PRESETS=\(\)[[:space:]]*$' "$preset" 2>/dev/null; then
+            continue
+        fi
+        cat >> "$preset" <<'PRESETNOTE'
+
+# MAZE_PRESET_NOTICE — added by maze-secureboot; the marker keeps this idempotent.
+# mkinitcpio SOURCES this file, so this runs on every 'mkinitcpio -P'. With
+# PRESETS=() that command does nothing at all; saying so is the difference
+# between an inert command and a misleading one. Prints once per installed
+# kernel (process_preset is a subshell function, so no guard is possible) —
+# which puts it beside each "Preset file is empty" warning it explains.
+echo "==> NOTE (Maze Linux): this does NOT rebuild your boot images. Maze boots" >&2
+echo "==>   Unified Kernel Images (layout=uki), so presets are empty by design." >&2
+echo "==>   Rebuild + re-sign with:  sudo maze-initramfs-rebuild" >&2
+PRESETNOTE
+    done
+}
+
+post_install() {
+    _migrate
+    _enable_units
+    _check_layout
+    _add_preset_notice
+
+    # One-time full repair. This is the moment we take over a machine whose
+    # signing may have been silently failing, so rebuild the UKI for every
+    # installed kernel and re-sign, rather than only re-signing what is there.
+    # Best-effort throughout: a failure here must never fail the transaction —
+    # the packaged hooks will retry on the next kernel/systemd update anyway.
+    if [ -r /var/lib/maze-secureboot/MOK.key ] && [ -d /run/systemd/system ]; then
+        echo ">> maze-secureboot: rebuilding and re-signing the boot chain…"
+        for d in /usr/lib/modules/*/; do
+            [ -f "${d}vmlinuz" ] || continue
+            kver="${d%/}"; kver="${kver##*/}"
+            kernel-install add "$kver" "${d}vmlinuz" >/dev/null 2>&1 \
+                || echo ">> maze-secureboot: WARNING - kernel-install add failed for $kver"
+        done
+        /usr/bin/maze-sb-sign --force-bootloader \
+            || echo ">> maze-secureboot: WARNING - signing reported problems; run 'sudo maze-sb-sign --force-bootloader' and check the output BEFORE rebooting."
+    fi
+    echo ">> maze-secureboot: Secure Boot chain is now package-managed (updates arrive via pacman)."
+    # Say something true about THIS machine rather than assuming the repair
+    # worked. Never fails the transaction: the flag file and maze-boot-guard
+    # carry an unsafe result forward on their own.
+    /usr/bin/maze-boot-check || true
+}
+
+post_upgrade() {
+    # Still run the migration: it is idempotent, and it also covers a machine
+    # that had this package but was later re-touched by an old installer.
+    _migrate
+    _enable_units
+    _check_layout
+    _add_preset_notice
+
+    # Hand the re-sign to the self-heal unit with --no-block so it runs AFTER
+    # this transaction. Doing it inline would race the kernel hooks in the same
+    # `pacman -Syu` and could report a stale-UKI error for a kernel whose
+    # PostTransaction hook has not run yet.
+    if [ -d /run/systemd/system ]; then
+        systemctl start --no-block maze-sb-resign.service >/dev/null 2>&1 || true
+    fi
+    echo ">> maze-secureboot: if a second kernel is installed, the re-sign now also"
+    echo ">>   builds a recovery boot entry for it under EFI/maze-recovery and adds"
+    echo ">>   it to the firmware boot menu. Pick 'Maze Linux (recovery kernel)'"
+    echo ">>   from the boot menu (F12 on most machines) when the normal one fails."
+    echo ">>   Verify it with: sudo maze-boot-check"
+}
+
+post_remove() {
+    # Drop the shims — they would otherwise point at binaries that no longer
+    # exist, which is worse than not being there at all.
+    for f in /usr/local/bin/maze-sb-sign /usr/local/bin/maze-kernel-install-add; do
+        if [ -f "$f" ] && grep -qs "$_SHIM_MARK" "$f"; then
+            rm -f "$f" && echo ">> maze-secureboot: removed shim $f"
+        fi
+    done
+    # Leaving the flag behind would inhibit shutdown with nothing left that can
+    # clear it — the guard unit is going away with this package.
+    rm -f /var/lib/maze/boot-unsafe 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo ">> maze-secureboot: REMOVED. Kernel updates no longer rebuild or sign the UKI."
+    echo ">>   With Secure Boot enabled this machine will stop booting new kernels."
+}

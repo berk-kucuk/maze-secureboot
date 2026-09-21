@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify the Maze Secure Boot chain
+Documentation=man:maze-boot-check(1)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Exit 1 just means "the chain is unsafe" — the flag file and the guard unit
+# carry that forward. Do not let it show up as a failed unit as well.
+SuccessExitStatus=0 1
+ExecStart=/usr/bin/maze-boot-check --quiet

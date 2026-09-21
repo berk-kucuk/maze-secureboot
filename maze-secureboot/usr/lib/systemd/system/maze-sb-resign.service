@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-sign bootloader and kernels for Secure Boot (Maze)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/maze-sb-sign
+
+[Install]
+WantedBy=multi-user.target

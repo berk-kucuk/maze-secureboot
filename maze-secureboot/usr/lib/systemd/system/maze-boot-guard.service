@@ -1,0 +1,9 @@
+[Unit]
+Description=Hold a shutdown inhibitor while the Maze boot chain is unsafe
+Documentation=man:maze-boot-check(1)
+ConditionPathExists=/var/lib/maze/boot-unsafe
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/maze-boot-guard
+Restart=no

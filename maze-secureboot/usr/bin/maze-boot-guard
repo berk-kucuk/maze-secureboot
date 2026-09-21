@@ -1,0 +1,36 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-secureboot).
+#
+# Holds a logind shutdown inhibitor for as long as the boot chain is unsafe, so
+# a machine that would not come back up cannot be rebooted by accident.
+#
+# What this does and does NOT stop:
+#   * Plasma's log-out menu: the shutdown dialog lists this inhibitor with the
+#     reason below and offers to go ahead anyway. That is the intended shape —
+#     a confirmation with an explanation, not a locked door.
+#   * `systemctl reboot -i` and `reboot -f`: NOT stopped, deliberately. An
+#     administrator has to keep the last word on their own machine — the job
+#     here is to make sure the decision is an informed one, not to lock anyone
+#     out of their computer.
+#
+# The reason string below is the entire user interface of this tool on a
+# desktop: it is what appears in that dialog, it is all most people will read,
+# and someone whose laptop is at 3% battery has to be able to act on it in one
+# sentence. So it says what breaks, what to run, and that they can still shut
+# down — in that order.
+set -u
+
+FLAG=/var/lib/maze/boot-unsafe
+
+# Nothing wrong: exit cleanly. The .path unit restarts us if the flag appears.
+[ -e "$FLAG" ] || exit 0
+
+reason="$(head -n 3 "$FLAG" 2>/dev/null | tr '\n' '; ')"
+[ -n "$reason" ] || reason="the boot chain could not be verified"
+
+exec systemd-inhibit \
+    --what=shutdown \
+    --mode=block \
+    --who="Maze boot guard" \
+    --why="This machine may not start up again. ${reason} To repair it, run 'sudo maze-boot-check --repair' in a terminal. You can still shut down anyway if you need to." \
+    sh -c 'while [ -e '"$FLAG"' ]; do sleep 5; done'

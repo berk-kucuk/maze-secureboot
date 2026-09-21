@@ -1,0 +1,23 @@
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/systemd/boot/efi/*
+Target = etc/kernel/cmdline
+Target = etc/mkinitcpio.conf
+
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = systemd
+Target = mkinitcpio
+Target = maze-secureboot
+
+[Action]
+Description = Verifying the boot chain before you can reboot into it (Maze)...
+When = PostTransaction
+Exec = /usr/bin/maze-boot-check --quiet

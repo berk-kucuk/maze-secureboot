@@ -1,0 +1,336 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-secureboot).
+#
+# maze-boot-entries — show the firmware boot menu, and clear out the Maze
+# entries that no longer lead anywhere.
+#
+# WHY THEY PILE UP
+#
+# Installing Maze creates an NVRAM entry pointing at shim. Until recently the
+# installer created one every time without checking for an existing one, so a
+# machine reinstalled four times ended up with four identical "Maze Linux"
+# lines in its boot menu, three of which may point at partitions that were
+# wiped by the very reinstall that added the next one.
+#
+# WHAT THIS WILL AND WILL NOT TOUCH
+#
+# Only entries Maze created — matched by label. Windows, firmware setup, network
+# boot and anything else another OS installed are listed for context and never
+# modified: a boot menu is shared property, and a tool that tidies away someone
+# else's operating system is a bug, not a feature.
+#
+# Within Maze's own entries it removes two kinds:
+#   * dead      — following it leads nowhere
+#   * duplicate — same label and same target as an entry that is kept
+#
+# "Dead" is decided by actually looking, not by guessing from the partition
+# table. The entry names a partition and a file on it; both have to be there.
+# A partition that still exists proves nothing on its own — reformatting an ESP,
+# or removing an installation without removing its NVRAM entry, leaves the
+# partition in place and the loader gone.
+#
+# The check has three outcomes, not two, and the third is the important one:
+# when it cannot look (the partition is not mounted and this is not running as
+# root) the entry is reported as unverified and KEPT. Reading "I could not
+# check" as "it is dead" is exactly how a tool deletes the boot entry of a
+# second, perfectly good installation.
+#
+# More than one Maze install on the same machine is expected and supported. An
+# entry on a different partition that really does hold a loader is labelled as
+# another installation and left alone, even though this system did not boot it.
+#
+# It will never remove the entry this machine actually booted from
+# (BootCurrent), and it refuses to remove the last surviving Maze entry, even
+# when that entry looks dead — being wrong about that would cost someone their
+# machine, and the removable \EFI\BOOT\BOOTX64.EFI fallback is not guaranteed on
+# every firmware.
+#
+# Usage:
+#   maze-boot-entries           show what is there and what would go
+#   maze-boot-entries --clean   remove them (asks first)
+#   maze-boot-entries --clean --yes
+set -u
+
+LABELS="Maze Linux
+Maze Linux (recovery kernel)"
+
+CLEAN=0
+YES=0
+for a in "$@"; do
+    case "$a" in
+        --clean) CLEAN=1 ;;
+        -y|--yes) YES=1 ;;
+        -h|--help) sed -n '4,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "maze-boot-entries: unknown option '$a'" >&2; exit 2 ;;
+    esac
+done
+
+command -v efibootmgr >/dev/null 2>&1 || {
+    echo "maze-boot-entries: efibootmgr is not installed" >&2; exit 1; }
+[ -d /sys/firmware/efi ] || {
+    echo "maze-boot-entries: this machine did not boot in UEFI mode" >&2; exit 1; }
+
+RAW="$(efibootmgr -v 2>/dev/null)" || {
+    echo "maze-boot-entries: could not read the firmware boot entries" >&2; exit 1; }
+
+CURRENT="$(printf '%s\n' "$RAW" | sed -n 's/^BootCurrent: *//p' | tr -d '[:space:]')"
+ORDER="$(printf '%s\n' "$RAW" | sed -n 's/^BootOrder: *//p' | tr -d '[:space:]')"
+
+# The ESP this running system boots from. Entries pointing at a different
+# partition that still holds a loader belong to another Maze installation —
+# they are reported as such and never removed.
+OUR_ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+[ -n "$OUR_ESP" ] || OUR_ESP=/boot
+OUR_GUID="$(lsblk -rno PARTUUID "$(findmnt -no SOURCE "$OUR_ESP" 2>/dev/null)" 2>/dev/null \
+            | head -n 1 | tr 'A-Z' 'a-z' || true)"
+
+is_maze_label() {
+    printf '%s\n' "$LABELS" | grep -Fxq "$1"
+}
+
+# The HD(...) partition GUID of one entry's device path, lowercased.
+path_guid() {
+    printf '%s\n' "$1" | sed -n 's/.*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1/p' \
+        | tr 'A-Z' 'a-z' | head -n 1
+}
+
+# The loader path, as a path relative to the partition root. Older efibootmgr
+# printed it as File(\EFI\BOOT\BOOTX64.EFI); efibootmgr >= 18 prints the raw
+# device path, HD(...)/\EFI\BOOT\BOOTX64.EFI. Only the first form was handled
+# until 1.2.0-15, so on a current system every entry came back as "could not
+# verify - kept" and --clean could never remove anything (found by running the
+# tool on real hardware, 14 Sep 2026). Both forms are accepted now.
+path_file() {
+    printf '%s\n' "$1" | sed -n \
+        -e 's/.*[)/]File(\([^)]*\)).*/\1/p' \
+        -e 's/.*)\/\(\\[^[:space:]]*\).*/\1/p' \
+        | head -n 1 | tr '\\' '/' | sed 's#^/*##'
+}
+
+# Does the entry actually lead to a file that exists?
+#
+#   0  yes - there is a loader there
+#   1  no  - the partition is present but that file is not on it
+#   2  cannot tell - do not touch it
+#
+# The three-way answer is the point. A partition that still exists is NOT proof
+# the entry works: reformatting the ESP, or removing an installation without
+# removing its NVRAM entry, leaves the partition in place and the loader gone.
+# Equally, "I could not look" must never be read as "it is dead" — that is how a
+# tool deletes the boot entry of a second, perfectly good installation.
+target_exists() {
+    _guid="$1"; _file="$2"
+    [ -n "$_guid" ] || return 2
+    _dev="/dev/disk/by-partuuid/$_guid"
+    [ -b "$_dev" ] || return 1          # partition itself is gone
+    [ -n "$_file" ] || return 2
+
+    # Already mounted somewhere (normally our own ESP): just look.
+    _mp="$(findmnt -no TARGET --source "$_dev" 2>/dev/null | head -n 1)"
+    if [ -n "$_mp" ]; then
+        [ -e "$_mp/$_file" ] && return 0
+        return 1
+    fi
+
+    # Not mounted. Only root can look, and only read-only, and the mount is
+    # always undone.
+    [ "$(id -u)" -eq 0 ] || return 2
+    _tmp="$(mktemp -d 2>/dev/null)" || return 2
+    # -t vfat on purpose. An EFI system partition is always vfat, and naming the
+    # type makes mount fail immediately on anything else instead of walking every
+    # filesystem driver in turn — which on a damaged or unexpected partition can
+    # block for a long time inside what is supposed to be a read-only report.
+    if mount -t vfat -o ro,nosuid,nodev,noexec "$_dev" "$_tmp" 2>/dev/null; then
+        if [ -e "$_tmp/$_file" ]; then _r=0; else _r=1; fi
+        umount "$_tmp" 2>/dev/null || umount -l "$_tmp" 2>/dev/null || true
+        rmdir "$_tmp" 2>/dev/null || true
+        return "$_r"
+    fi
+    rmdir "$_tmp" 2>/dev/null || true
+    return 2
+}
+
+echo "maze-boot-entries"
+echo
+
+# ── Pass 1: describe every entry ────────────────────────────────────────────
+
+printf '  %-6s %-34s %s\n' "Entry" "Label" "Status"
+printf '  %-6s %-34s %s\n' "-----" "---------------------------------" "------"
+
+SEEN=""       # "num<TAB>label<TAB>target" of Maze entries we are keeping
+DOOMED=""     # boot numbers to remove
+n_maze=0
+n_unsigned_sdboot=0
+
+# Walked from a here-doc rather than a pipe on purpose: a piped `while` runs in
+# a subshell, and SEEN/DOOMED would be discarded the moment the loop ended.
+ENTRIES="$(printf '%s\n' "$RAW" | grep -E '^Boot[0-9A-Fa-f]{4}')"
+
+# Record the entry we actually booted from BEFORE walking the list. Duplicates
+# are judged against what is already kept, and the boot menu is not ordered by
+# anything meaningful — so without this, an identical entry that merely appears
+# earlier is treated as the original and the one that demonstrably works is
+# treated as its copy. Both then survive, which is the case a user notices.
+if [ -n "$CURRENT" ]; then
+    _cl="$(printf '%s\n' "$ENTRIES" | sed -n "s/^Boot${CURRENT}[* ] *//p" | head -n 1)"
+    if [ -n "$_cl" ]; then
+        SEEN="$SEEN
+$(printf '%s' "$_cl" | cut -f1)	$(printf '%s' "$_cl" | cut -f2-)"
+    fi
+fi
+
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    num="$(printf '%s' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')"
+    [ -n "$num" ] || continue
+    rest="$(printf '%s' "$line" | sed 's/^Boot[0-9A-Fa-f]\{4\}[* ] *//')"
+    label="$(printf '%s' "$rest" | cut -f1)"
+    target="$(printf '%s' "$rest" | cut -f2-)"
+
+    if ! is_maze_label "$label"; then
+        # Not ours, so never touched — but say when it is the unsigned
+        # systemd-boot entry Calamares' `bootctl install` leaves behind
+        # ("Linux Boot Manager" / "Fallback Linux Boot Manager"). It points
+        # straight at systemd-boot(-fallback)x64.efi, which is signed by nobody:
+        # with Secure Boot on it can never boot, and as a firmware fallback it
+        # only produces a "Security Violation" screen.
+        case "$target" in
+            *systemd-boot*x64.efi*)
+                printf '  %-6s %-34s %s\n' "$num" "$label" "not Maze - left alone (UNSIGNED systemd-boot; cannot boot with Secure Boot on)"
+                n_unsigned_sdboot=$((n_unsigned_sdboot + 1)) ;;
+            *)
+                printf '  %-6s %-34s %s\n' "$num" "$label" "not Maze - left alone" ;;
+        esac
+        continue
+    fi
+
+    n_maze=$((n_maze + 1))
+    status=""
+
+    if [ "$num" = "$CURRENT" ]; then
+        status="booted from this one - kept"
+    else
+        guid="$(path_guid "$target")"
+        file="$(path_file "$target")"
+        key="$label	$target"
+        target_exists "$guid" "$file"; _te=$?
+        if printf '%s\n' "$SEEN" | grep -Fxq "$key"; then
+            status="DUPLICATE of an entry above"
+            DOOMED="$DOOMED $num"
+        elif [ "$_te" -eq 1 ]; then
+            if [ -b "/dev/disk/by-partuuid/$guid" ]; then
+                status="DEAD - nothing at that path any more"
+            else
+                status="DEAD - its partition no longer exists"
+            fi
+            DOOMED="$DOOMED $num"
+        elif [ "$_te" -eq 2 ]; then
+            # Could not verify. Kept on purpose, and said out loud so nobody
+            # assumes silence meant it was checked.
+            status="could not verify - kept"
+        else
+            if [ "$guid" != "$OUR_GUID" ] && [ -n "$OUR_GUID" ]; then
+                status="another Maze installation - kept"
+            else
+                status="ok"
+            fi
+        fi
+    fi
+
+    case "$status" in
+        ok|"another Maze installation - kept"|"could not verify - kept")
+            SEEN="$SEEN
+$label	$target" ;;
+    esac
+    printf '  %-6s %-34s %s\n' "$num" "$label" "$status"
+done <<ENTRIES_EOF
+$ENTRIES
+ENTRIES_EOF
+
+echo
+
+# Count what survives. Refusing to leave zero Maze entries is the one rule that
+# cannot be traded away.
+n_doomed=0
+for _d in $DOOMED; do n_doomed=$((n_doomed + 1)); done
+
+if [ "$n_unsigned_sdboot" -gt 0 ]; then
+    echo "  Note: $n_unsigned_sdboot unsigned systemd-boot entr$( [ "$n_unsigned_sdboot" -eq 1 ] && echo y || echo ies ) from the installer's bootctl."
+    echo "  Not Maze's, so not removed here; harmless while a Maze entry is first in BootOrder."
+    echo "  To drop one by hand: sudo efibootmgr --bootnum XXXX --delete-bootnum"
+fi
+
+if [ "$n_doomed" -eq 0 ]; then
+    echo "  Nothing to clean up - every Maze entry points somewhere real."
+    echo
+    exit 0
+fi
+
+if [ "$n_maze" -le "$n_doomed" ]; then
+    echo "  Refusing to act: that would remove every Maze boot entry."
+    echo "  Something about this machine does not match what this tool expects."
+    echo
+    exit 1
+fi
+
+echo "  $n_doomed of $n_maze Maze entries lead nowhere:$DOOMED"
+echo
+
+if [ "$CLEAN" != 1 ]; then
+    echo "  Nothing was changed. Remove them with:"
+    echo "      sudo maze-boot-entries --clean"
+    echo
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "maze-boot-entries: --clean needs root" >&2; exit 1; }
+
+if [ "$YES" != 1 ]; then
+    echo "  This edits firmware NVRAM and cannot be undone from here."
+    printf "  Type 'yes' to remove them: "
+    read -r answer
+    [ "$answer" = "yes" ] || { echo "  Cancelled - nothing changed."; exit 0; }
+    echo
+fi
+
+# Save the current state first, and treat failing to save it as a reason not to
+# proceed. Deleting NVRAM entries cannot be undone from this tool; the saved
+# file is what lets someone rebuild an entry by hand from a live USB, and doing
+# the irreversible half without the record is the wrong trade.
+# The result is checked by reading the file back, not by trusting an exit
+# status: `if ! { ...; } > file` reports success even when the redirection
+# fails to open the file, so the one case this guard exists for is exactly the
+# one an exit-status check does not catch.
+BACKUP=/var/lib/maze/efi-entries.before
+mkdir -p /var/lib/maze 2>/dev/null || true
+rm -f "$BACKUP" 2>/dev/null || true
+{
+    echo "# Firmware boot entries before maze-boot-entries --clean"
+    echo "# $(date '+%Y-%m-%d %H:%M:%S')"
+    printf '%s\n' "$RAW"
+} > "$BACKUP" 2>/dev/null
+
+if [ ! -s "$BACKUP" ]; then
+    echo "maze-boot-entries: could not write $BACKUP - not deleting anything." >&2
+    echo "maze-boot-entries: (that file is the only record of what is there now)" >&2
+    exit 1
+fi
+
+removed=0
+for num in $DOOMED; do
+    if efibootmgr --bootnum "$num" --delete-bootnum >/dev/null 2>&1; then
+        echo "  removed Boot$num"
+        removed=$((removed + 1))
+    else
+        echo "  could NOT remove Boot$num" >&2
+    fi
+done
+
+echo
+echo "  Removed $removed entries. Previous state saved to"
+echo "  $BACKUP"
+echo
+echo "  Boot menu now:"
+efibootmgr 2>/dev/null | grep -E '^Boot[0-9A-Fa-f]{4}' | sed 's/^/    /'
+echo

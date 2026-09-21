@@ -1,0 +1,10 @@
+# Maze Linux — default-enabled units shipped by the maze-secureboot package.
+#
+# Applied by `systemctl preset-all` at image-build / first boot, and by the
+# package's own .install scriptlet on live installs. Every one of these is a
+# no-op on a machine with no MOK key, so enabling them unconditionally is safe.
+
+enable maze-sb-resign.path
+enable maze-sb-resign.service
+enable maze-boot-guard.path
+enable maze-boot-check.timer

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Managed by Maze Linux. Rebuilds + signs the UKI (grubx64.efi) after every
+# kernel-install add, so the shim chain stays current and signed.
+set -eu
+[ "${1:-}" = "add" ] || exit 0
+
+KEYDIR=/var/lib/maze-secureboot
+[ -r "$KEYDIR/MOK.key" ] && [ -r "$KEYDIR/MOK.crt" ] || exit 0
+command -v ukify >/dev/null 2>&1 || exit 0
+command -v sbsign >/dev/null 2>&1 || exit 0
+
+# Delegate to the full signer script — it finds the UKI kernel-install just
+# built under $ESP/EFI/Linux/, signs it with the MOK key, and installs it as
+# grubx64.efi on the ESP. Using the full script (instead of duplicating the
+# find/sbsign logic here) keeps a single source of truth.
+/usr/bin/maze-sb-sign --force-bootloader >/dev/null 2>&1 || true
+exit 0

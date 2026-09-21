@@ -1,0 +1,32 @@
+#!/bin/sh
+# Managed by Maze Linux. Invoked by the 85-maze-kernel-install.hook pacman
+# hook (NeedsTargets) for every usr/lib/modules/*/vmlinuz install/upgrade.
+# Runs `kernel-install add` so layout=uki actually rebuilds the Unified Kernel
+# Image on the ESP for the new kernel — mkinitcpio's own preset-driven pacman
+# hook only ever produces loose /boot/initramfs-*.img and never calls
+# kernel-install itself. Reads NUL-free paths (one per line) from stdin.
+set -u
+rc=0
+while IFS= read -r f; do
+    case "$f" in
+        usr/lib/modules/*/vmlinuz)
+            kver="${f#usr/lib/modules/}"
+            kver="${kver%/vmlinuz}"
+            [ -d "/usr/lib/modules/$kver" ] || continue
+            if ! kernel-install add "$kver" "/usr/lib/modules/$kver/vmlinuz"; then
+                rc=1
+                echo "maze-kernel-install-add: ERROR - kernel-install add FAILED for $kver" >&2
+                echo "maze-kernel-install-add:   The UKI on the ESP was NOT rebuilt, so this machine" >&2
+                echo "maze-kernel-install-add:   still boots the PREVIOUS kernel — whose modules this" >&2
+                echo "maze-kernel-install-add:   upgrade just deleted. DO NOT REBOOT until it is fixed:" >&2
+                echo "maze-kernel-install-add:     sudo kernel-install add $kver /usr/lib/modules/$kver/vmlinuz" >&2
+                echo "maze-kernel-install-add:     sudo maze-sb-sign --force-bootloader" >&2
+            fi
+            ;;
+    esac
+done
+# Exit non-zero so pacman reports the hook as failed. This used to swallow the
+# failure (echo, then exit 0): the one moment the user could still have fixed
+# things — still booted, still root, mid-transaction — passed with nothing but a
+# line lost in the upgrade scroll, and the machine died on the next reboot.
+exit "$rc"

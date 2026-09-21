@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for an unsafe Maze boot chain and inhibit shutdown
+
+[Path]
+PathExists=/var/lib/maze/boot-unsafe
+Unit=maze-boot-guard.service
+
+[Install]
+WantedBy=paths.target

@@ -1,0 +1,11 @@
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Building Unified Kernel Image via kernel-install (Maze)...
+When = PostTransaction
+Exec = /usr/bin/maze-kernel-install-add
+NeedsTargets
