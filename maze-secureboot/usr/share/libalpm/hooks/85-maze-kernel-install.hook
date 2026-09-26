@@ -1,11 +1,58 @@
+# Rebuild the Unified Kernel Images (kernel + initramfs + cmdline + stub).
+#
+# A UKI is rebuilt only by `kernel-install add`, and nothing else on a Maze
+# system calls it: the mkinitcpio presets are empty by design (layout=uki), so
+# Arch's own 90-mkinitcpio-install.hook — which reacts to exactly the paths
+# below — does nothing here. This hook used to watch only the kernel image, so a
+# cryptsetup, CPU microcode, firmware, systemd, Plymouth or systemd-stub update
+# never reached the image that boots until the next KERNEL update: the disk was
+# unlocked by the old cryptsetup, the CPU ran without the new microcode, and a
+# stub whose SBAT generation shim had revoked kept booting — or stopped booting.
+#
+# Kernel install/upgrade: only that kernel is rebuilt. Anything else below:
+# every installed kernel is (maze-kernel-install-add decides from the targets).
+# It runs after the DKMS hooks (70-*) and before the signer (zz-*).
+
 [Trigger]
 Type = Path
 Operation = Install
 Operation = Upgrade
 Target = usr/lib/modules/*/vmlinuz
 
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+# Same set Arch's 90-mkinitcpio-install.hook watches: what goes INTO the initramfs.
+Target = usr/lib/initcpio/*
+Target = usr/lib/firmware/*
+Target = usr/lib/modules/*/extramodules/
+Target = usr/src/*/dkms.conf
+Target = usr/lib/systemd/systemd
+Target = usr/lib/systemd/systemd-udevd
+Target = usr/bin/cryptsetup
+Target = usr/bin/lvm
+Target = usr/bin/mdadm
+Target = usr/lib/libcryptsetup.so
+Target = usr/lib/libp11-kit.so
+Target = usr/lib/libpcsclite.so
+Target = usr/lib/modprobe.d/
+# Early microcode (intel-ucode / amd-ucode).
+Target = boot/*-ucode.img
+# The Maze Plymouth theme is embedded in the initramfs (passphrase screen).
+Target = usr/share/plymouth/themes/*
+# The UEFI stub the UKI is built around (SBAT generation, stub fixes).
+Target = usr/lib/systemd/boot/efi/linuxx64.efi.stub
+
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = mkinitcpio
+
 [Action]
-Description = Building Unified Kernel Image via kernel-install (Maze)...
+Description = Building Unified Kernel Images via kernel-install (Maze)...
 When = PostTransaction
 Exec = /usr/bin/maze-kernel-install-add
 NeedsTargets

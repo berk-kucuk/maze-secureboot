@@ -2,6 +2,7 @@
 Type = Path
 Operation = Install
 Operation = Upgrade
+Operation = Remove
 Target = usr/lib/modules/*/vmlinuz
 Target = usr/lib/systemd/boot/efi/*
 Target = boot/vmlinuz-*
@@ -24,4 +25,4 @@ Target = systemd
 [Action]
 Description = Signing bootloader and kernels for Secure Boot (Maze)...
 When = PostTransaction
-Exec = /usr/bin/maze-sb-sign --force-bootloader
+Exec = /usr/bin/maze-sb-sign

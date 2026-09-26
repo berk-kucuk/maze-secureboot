@@ -178,9 +178,21 @@ PRESETNOTE
     done
 }
 
+# The NvPCR units are skipped from now on (see the 10-maze-no-nvpcr.conf
+# drop-ins), but on a machine that already booted with systemd >= 262 they are
+# sitting in "failed" and the system says "degraded" until the next boot. The
+# failures are stale the moment the drop-ins exist: clear them now.
+_clear_nvpcr_failures() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed systemd-tpm2-setup-early.service systemd-pcrproduct.service \
+        'systemd-pcrlogin@*.service' >/dev/null 2>&1 || true
+}
+
 post_install() {
     _migrate
     _enable_units
+    _clear_nvpcr_failures
     _check_layout
     _add_preset_notice
 
@@ -212,6 +224,7 @@ post_upgrade() {
     # that had this package but was later re-touched by an old installer.
     _migrate
     _enable_units
+    _clear_nvpcr_failures
     _check_layout
     _add_preset_notice
 

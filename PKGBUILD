@@ -39,7 +39,7 @@
 
 pkgname=maze-secureboot
 pkgver=1.2.0
-pkgrel=15
+pkgrel=19
 pkgdesc="Maze Linux Secure Boot chain — UKI rebuild, MOK signing, and a boot-chain check that blocks unsafe reboots"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"
@@ -64,6 +64,15 @@ install="${pkgname}.install"
 backup=(
   'etc/xdg/autostart/maze-boot-warning.desktop'
   'etc/profile.d/maze-boot-warning.sh'
+  # ── Adopted from the ISO's airootfs (2026-09) ──────────────────────────────
+  # These used to exist only in the live image, so installed machines carried
+  # them UNOWNED and no update ever reached them. They are in backup=() so the
+  # takeover is silent: pacman does not treat an existing unowned file that the
+  # package lists as a backup as a conflict — an identical copy is simply
+  # adopted, a locally edited one is kept and the packaged one lands as .pacnew.
+  # Without this, `pacman -Syu` on every installed Maze would stop with
+  # "exists in filesystem" until the user ran --overwrite by hand.
+  'etc/kernel/install.conf'
 )
 source=()
 
@@ -93,6 +102,9 @@ package() {
             "${pkgdir}"/usr/lib/systemd/system/systemd-boot-update.service.d/*.conf \
             "${pkgdir}"/usr/lib/systemd/system/emergency.service.d/*.conf \
             "${pkgdir}"/usr/lib/systemd/system/rescue.service.d/*.conf \
+            "${pkgdir}"/usr/lib/systemd/system/systemd-tpm2-setup-early.service.d/*.conf \
+            "${pkgdir}"/usr/lib/systemd/system/systemd-pcrproduct.service.d/*.conf \
+            "${pkgdir}"/usr/lib/systemd/system/systemd-pcrlogin@.service.d/*.conf \
             "${pkgdir}"/usr/lib/systemd/system-preset/*.preset \
             "${pkgdir}"/etc/xdg/autostart/*.desktop \
             "${pkgdir}"/etc/profile.d/*.sh

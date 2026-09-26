@@ -43,6 +43,18 @@ for arg in "$@"; do
     esac
 done
 
+# Inside a chroot (the installer's deploy step, or a repair from the live ISO)
+# this is not the system that boots next: the machine key may not be enrolled
+# yet, the running firmware state belongs to the rescue medium, and no guard
+# can hold an inhibitor here. A flag written now would only surface on the
+# next boot as a false "this machine may not start up again" — and the booted
+# system re-checks itself 3 minutes after start (maze-boot-check.timer). So
+# report as usual, but never touch the flag.
+if [ "$USE_FLAG" = 1 ] && command -v systemd-detect-virt >/dev/null 2>&1 \
+   && systemd-detect-virt --chroot >/dev/null 2>&1; then
+    USE_FLAG=0
+fi
+
 FAILURES=""
 FIXES=""
 report=""

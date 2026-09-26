@@ -2,6 +2,8 @@
 # Managed by Maze Linux. Signs the kernel-install-built Unified Kernel Image
 # (layout=uki) that shim chainloads as grubx64.efi. Idempotent.
 # Usage: maze-sb-sign [ESP_MOUNTPOINT] [--force-bootloader]
+#   --force-bootloader  re-sign grubx64.efi even when it is already current
+#                       (repair); without it an up-to-date image is left alone.
 set -eu
 
 KEYDIR=/var/lib/maze-secureboot
@@ -64,16 +66,21 @@ install_if_diff() {
 sign_inplace() {
     f="$1"
     [ -e "$f" ] || return 0
-    if sbverify --cert "$CRT" "$f" >/dev/null 2>&1; then
+    # In a subshell: sbverify can crash on a truncated image, and the shell's
+    # own "Segmentation fault" notice would otherwise leak past the redirect.
+    if (sbverify --cert "$CRT" "$f") >/dev/null 2>&1; then
         echo "maze-sb-sign: OK     $f"
         return 0
     fi
-    if sbsign --key "$KEY" --cert "$CRT" --output "$f.maze-signed" "$f" 2>/dev/null; then
+    # stderr is captured and shown only on failure: "FAIL" alone does not say
+    # whether the ESP is full, the key unreadable or the image malformed.
+    if _sberr="$(sbsign --key "$KEY" --cert "$CRT" --output "$f.maze-signed" "$f" 2>&1 >/dev/null)"; then
         mv -f "$f.maze-signed" "$f"
         echo "maze-sb-sign: SIGNED $f"
     else
         rm -f "$f.maze-signed"
         echo "maze-sb-sign: FAIL   $f" >&2
+        [ -n "$_sberr" ] && printf '%s\n' "$_sberr" | sed 's/^/maze-sb-sign:   /' >&2
         status_ok=0
     fi
 }
@@ -242,12 +249,51 @@ if [ -s "$GRUB" ]; then
     prune_stale_ukis
 fi
 
-if [ -n "$UKI" ]; then
+# --- Sign the UKIs themselves first -----------------------------------------
+# grubx64.efi is made FROM the UKI, so sign the UKI before copying it. Signing it
+# afterwards (in the safety-net loop at the end) changed the UKI's bytes after
+# the copy, which made every following run see a "new" UKI and rewrite
+# grubx64.efi again.
+for _f in "$ESP"/EFI/Linux/*.efi; do
+    sign_inplace "$_f"
+done
+
+# --- Is grubx64.efi already current? ---------------------------------------
+# This script runs on every boot (maze-sb-resign.service) and up to three times
+# per kernel update. It used to re-sign and rewrite the ~45 MB grubx64.efi — the
+# one file shim boots — on every one of those runs, even when nothing had
+# changed: needless writes to a FAT filesystem that has no journal, of the most
+# important file on it, most of them during early boot. Now it is rewritten only
+# when its source UKI changed (sha256 recorded in grubx64.efi.maze-src), when the
+# kernel changed, when its signature no longer verifies, or on
+# --force-bootloader.
+GRUB_SRC="$GRUB.maze-src"
+UKI_SUM=""
+[ -n "$UKI" ] && UKI_SUM="$(sha256sum "$UKI" 2>/dev/null | cut -d' ' -f1)"
+grub_is_current() {
+    [ "$force_bootloader" = 0 ] || return 1
+    [ -n "$UKI_SUM" ] && [ -s "$GRUB" ] || return 1
+    [ "$(tr -d '[:space:]' < "$GRUB_SRC" 2>/dev/null || true)" = "$UKI_SUM" ] || return 1
+    [ "$(tr -d '[:space:]' < "$GRUB.maze-kver" 2>/dev/null || true)" = "$TARGET_KVER" ] || return 1
+    # The markers describe what was written, not what is there now: a hand
+    # copy (e.g. restoring grubx64.efi.maze-prev) leaves them stale. Read the
+    # kernel version out of the image itself before trusting them.
+    if command -v objcopy >/dev/null 2>&1; then
+        _gu="$(objcopy -O binary --only-section=.uname "$GRUB" /dev/stdout 2>/dev/null \
+                | tr -d '\0' | tr -d '[:space:]')"
+        [ -z "$_gu" ] || [ "$_gu" = "$TARGET_KVER" ] || return 1
+    fi
+    (sbverify --cert "$CRT" "$GRUB") >/dev/null 2>&1
+}
+
+if [ -n "$UKI" ] && grub_is_current; then
+    echo "maze-sb-sign: OK     $GRUB (kernel $TARGET_KVER, unchanged)"
+elif [ -n "$UKI" ]; then
     # Sign to a temp file and rename into place — never write $GRUB directly.
     # sbsign dying partway (disk full, killed mid-transaction) must not leave
     # a truncated/corrupt grubx64.efi with no working fallback, since it is the
     # ONLY thing shim chainloads.
-    if sbsign --key "$KEY" --cert "$CRT" --output "$GRUB.maze-signed" "$UKI" 2>/dev/null; then
+    if _sberr="$(sbsign --key "$KEY" --cert "$CRT" --output "$GRUB.maze-signed" "$UKI" 2>&1 >/dev/null)"; then
         # Keep the OUTGOING image as grubx64.efi.maze-prev. shim chainloads
         # grubx64.efi and nothing else — there is no systemd-boot menu and the
         # sd-boot NVRAM entry is deliberately removed — so until now a kernel
@@ -258,11 +304,20 @@ if [ -n "$UKI" ]; then
         # script runs up to three times per kernel upgrade, and rotating on every
         # run would overwrite the fallback with the very image it is a fallback
         # for. maze-kernel-helper writes the same marker when it pins a kernel.
+        #
+        # ONLY while the outgoing kernel is still installed. On an ordinary
+        # upgrade of the same kernel package (linux X -> linux Y) pacman has
+        # already deleted /usr/lib/modules/X by the time this runs, so a copy of
+        # the old image would be exactly the "boots, loads no module" brick
+        # described above — and it would be advertised as the way back. It stays
+        # useful when switching between two INSTALLED kernels (linux <->
+        # linux-lts via maze-kernel-helper, or the pin falling back).
         _prev_kver=""
         if [ -r "$GRUB.maze-kver" ]; then
             _prev_kver="$(tr -d '[:space:]' < "$GRUB.maze-kver" 2>/dev/null || true)"
         fi
-        if [ -s "$GRUB" ] && [ -n "$_prev_kver" ] && [ "$_prev_kver" != "$TARGET_KVER" ]; then
+        if [ -s "$GRUB" ] && [ -n "$_prev_kver" ] && [ "$_prev_kver" != "$TARGET_KVER" ] \
+           && [ -f "/usr/lib/modules/$_prev_kver/vmlinuz" ]; then
             if cp -f "$GRUB" "$GRUB.maze-prev" 2>/dev/null; then
                 printf '%s\n' "$_prev_kver" > "$GRUB.maze-prev.kver" 2>/dev/null || true
                 echo "maze-sb-sign: kept kernel $_prev_kver as ${GRUB}.maze-prev (rollback copy)"
@@ -276,11 +331,13 @@ if [ -n "$UKI" ]; then
         fi
         mv -f "$GRUB.maze-signed" "$GRUB"
         printf '%s\n' "$TARGET_KVER" > "$GRUB.maze-kver" 2>/dev/null || true
+        printf '%s\n' "$UKI_SUM" > "$GRUB_SRC" 2>/dev/null || true
         sync
         echo "maze-sb-sign: SIGNED $GRUB (from $UKI, kernel $TARGET_KVER)"
     else
         rm -f "$GRUB.maze-signed"
         echo "maze-sb-sign: FAIL signing $UKI as $GRUB" >&2
+        [ -n "$_sberr" ] && printf '%s\n' "$_sberr" | sed 's/^/maze-sb-sign:   /' >&2
         status_ok=0
     fi
 elif [ -n "$TARGET_KVER" ]; then
@@ -299,6 +356,22 @@ fi
 # the pre-sign prune to lean on.
 if [ "$status_ok" = 1 ]; then
     prune_stale_ukis
+fi
+
+# A rollback copy is only a way back while its kernel is installed. Once that
+# kernel's modules are gone (upgraded or removed) the copy boots into a system
+# that cannot load a single module, so drop it — together with its label —
+# instead of offering it below and in maze-doctor. An unlabelled copy cannot be
+# verified either, so it goes too.
+if [ -e "$GRUB.maze-prev" ]; then
+    _pv=""
+    if [ -r "$GRUB.maze-prev.kver" ]; then
+        _pv="$(tr -d '[:space:]' < "$GRUB.maze-prev.kver" 2>/dev/null || true)"
+    fi
+    if [ -z "$_pv" ] || [ ! -f "/usr/lib/modules/$_pv/vmlinuz" ]; then
+        rm -f "$GRUB.maze-prev" "$GRUB.maze-prev.kver" 2>/dev/null || true
+        echo "maze-sb-sign: removed rollback copy ${GRUB}.maze-prev${_pv:+ (kernel $_pv is no longer installed)}"
+    fi
 fi
 
 # Also sign any loose kernels/UKIs on the ESP as a safety net (in case the
