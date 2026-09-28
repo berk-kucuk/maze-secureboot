@@ -1,9 +1,10 @@
 # Rebuild the Unified Kernel Images (kernel + initramfs + cmdline + stub).
 #
 # A UKI is rebuilt only by `kernel-install add`, and nothing else on a Maze
-# system calls it: the mkinitcpio presets are empty by design (layout=uki), so
+# system calls it: the mkinitcpio presets are empty by design (layout=uki), and
 # Arch's own 90-mkinitcpio-install.hook — which reacts to exactly the paths
-# below — does nothing here. This hook used to watch only the kernel image, so a
+# below — is masked by /usr/lib/maze-secureboot/mkinitcpio-hooks, so this is the
+# ONE build path. This hook used to watch only the kernel image, so a
 # cryptsetup, CPU microcode, firmware, systemd, Plymouth or systemd-stub update
 # never reached the image that boots until the next KERNEL update: the disk was
 # unlocked by the old cryptsetup, the CPU ran without the new microcode, and a

@@ -240,6 +240,31 @@ else
     fi
 fi
 
+# --- 3b) NVIDIA: the boot kernel has the driver nouveau was traded for ------
+# nvidia-utils blacklists nouveau, so a boot kernel without the DKMS-built
+# nvidia module comes up with no driver for the card (black screen when the
+# monitor hangs off it). maze-sb-sign already steers around a kernel DKMS could
+# not build for; this proves the result, and reports that fallback while it is
+# active.
+if [ -n "${TARGET:-}" ] && [ -f "/usr/lib/modules/$TARGET/vmlinuz" ] \
+   && [ -f /usr/lib/modprobe.d/nvidia-utils.conf ] && command -v modinfo >/dev/null 2>&1; then
+    if modinfo -k "$TARGET" -n nvidia >/dev/null 2>&1; then
+        _nv_missing=""
+        for _k in $KERNELS; do
+            modinfo -k "$_k" -n nvidia >/dev/null 2>&1 || _nv_missing="$_nv_missing $_k"
+        done
+        if [ -n "$_nv_missing" ]; then
+            skip "NVIDIA driver not built for:$_nv_missing - booting $TARGET until it is (switches back by itself)"
+        else
+            ok "NVIDIA driver built for every installed kernel"
+        fi
+    else
+        bad "NVIDIA driver is not built for the boot kernel $TARGET" \
+            "nouveau is blacklisted by nvidia-utils: after a reboot the card has no driver (black screen if the monitor is on it)." \
+            "sudo pacman -Syu (prebuilt nvidia-open not yet out for it) / sudo dkms autoinstall -k $TARGET (DKMS) / sudo maze-gpu-driver --open"
+    fi
+fi
+
 # --- 4) signature -----------------------------------------------------------
 
 if [ ! -r "$CRT" ]; then
@@ -345,6 +370,28 @@ fi
 # mounts a tree with no /usr and the initramfs finds no init. Nothing else in
 # this script would notice, because every signature and every image is fine.
 
+# A default that differs from the running root is expected right after
+# `maze-rollback <n>`: it records the root it left in
+# /.snapshots/.maze-rollback-previous-default (/var/lib/maze/... before
+# maze-snapshots 1.1.0-7). Accept it only when that record
+# names the running root AND the new default is a snapper snapshot that
+# actually contains an init — a stale record must not hide a broken default.
+staged_rollback_root() {  # $1 = default subvolume id; prints its path
+    _rec="$(cat /.snapshots/.maze-rollback-previous-default 2>/dev/null \
+            || cat /var/lib/maze/rollback-previous-default 2>/dev/null)"
+    [ -n "$_rec" ] && [ "$_rec" = "$_cur_id" ] || return 1
+    _path="$(btrfs inspect-internal subvolid-resolve "$1" / 2>/dev/null)"
+    case "$_path" in
+        */.snapshots/*/snapshot|.snapshots/*/snapshot) ;;
+        *) return 1 ;;
+    esac
+    # /.snapshots is the snapshot store (mounted from fstab by maze-snapshots),
+    # so <n>/snapshot under it is the same tree whichever root is running.
+    _n="${_path%/snapshot}"; _n="${_n##*/}"
+    [ -x "/.snapshots/$_n/snapshot/usr/lib/systemd/systemd" ] || return 1
+    printf '%s\n' "$_path"
+}
+
 if [ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] && command -v btrfs >/dev/null 2>&1; then
     _cur_id="$(findmnt -no OPTIONS / | tr ',' '\n' | sed -n 's/^subvolid=//p')"
     _def_id="$(btrfs subvolume get-default / 2>/dev/null | awk '{print $2}')"
@@ -354,6 +401,11 @@ if [ "$(findmnt -no FSTYPE / 2>/dev/null)" = "btrfs" ] && command -v btrfs >/dev
         skip "Could not read the btrfs default subvolume"
     elif [ "$_def_id" = "$_cur_id" ]; then
         ok "btrfs default subvolume is the running root ($_cur_id) - rollback works"
+    elif [ "$_def_id" != 5 ] && _staged="$(staged_rollback_root "$_def_id")"; then
+        # maze-rollback just moved the default on purpose. Calling that a
+        # failure — and printing the set-default that silently cancels it, as
+        # this check used to — undoes the rollback the user asked for.
+        ok "Rollback staged: next boot uses subvolume $_def_id ($_staged) - undo with: sudo maze-rollback --undo"
     else
         bad "btrfs default subvolume is $_def_id, but / is running from $_cur_id" \
             "Nothing pins the subvolume in the cmdline, so the next boot mounts the wrong tree." \

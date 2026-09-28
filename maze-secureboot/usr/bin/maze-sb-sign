@@ -204,6 +204,51 @@ if [ -z "$TARGET_KVER" ]; then
     fi
 fi
 
+# --- Never hand shim a kernel the NVIDIA driver did not build for ----------
+# nvidia-utils blacklists nouveau unconditionally (/usr/lib/modprobe.d/
+# nvidia-utils.conf). A kernel DKMS could not build the nvidia module for
+# therefore comes up with NO driver for the card: a black screen on a desktop
+# whose monitor hangs off it, a dead dGPU on a hybrid laptop. It happens on an
+# ordinary `pacman -Syu` — a new kernel lands before NVIDIA supports it (615 on
+# kernel 7.2) — and maze-gpu-driver, which knows how to pin around it, never
+# runs then. This runs at the end of every such transaction (after the 70-dkms
+# hooks), so it is the one place that can keep the machine booting into a
+# working display without the user doing anything.
+#
+# The fallback is TRANSIENT, not a pin: nothing is written to
+# /etc/maze/kernel-default. Every later run starts from the normal choice again,
+# so the moment the module exists for the new kernel (Arch's nvidia-open
+# rebuild, or a DKMS build) the machine moves onto it by itself.
+# maze-boot-check reports the fallback while it is active.
+nv_module_for() { modinfo -k "$1" -n nvidia >/dev/null 2>&1; }
+if [ -n "$TARGET_KVER" ] && [ -f /usr/lib/modprobe.d/nvidia-utils.conf ] \
+   && command -v modinfo >/dev/null 2>&1 && ! nv_module_for "$TARGET_KVER"; then
+    _nv_alt=""
+    for _k in $(for _d in /usr/lib/modules/*/; do
+                    [ -f "${_d}vmlinuz" ] || continue
+                    _d="${_d%/}"; printf '%s\n' "${_d##*/}"
+                done | sort -rV); do
+        [ "$_k" = "$TARGET_KVER" ] && continue
+        nv_module_for "$_k" || continue
+        _nv_uki="$(find_uki "$_k" || true)"
+        [ -n "$_nv_uki" ] || continue
+        _nv_alt="$_k"
+        break
+    done
+    if [ -n "$_nv_alt" ]; then
+        echo "maze-sb-sign: WARNING - the NVIDIA driver is not built for kernel $TARGET_KVER." >&2
+        echo "maze-sb-sign:   Booting $_nv_alt (driver built) instead, so the display keeps working." >&2
+        echo "maze-sb-sign:   This switches back to $TARGET_KVER by itself once its module exists (the next nvidia-open update, or a DKMS build)." >&2
+        TARGET_KVER="$_nv_alt"
+        UKI="$_nv_uki"
+    else
+        echo "maze-sb-sign: WARNING - the NVIDIA driver is not built for kernel $TARGET_KVER, and no other" >&2
+        echo "maze-sb-sign:   kernel has both the driver and a boot image. nouveau is blacklisted, so the" >&2
+        echo "maze-sb-sign:   card will have NO driver after a reboot." >&2
+        echo "maze-sb-sign:   sudo maze-gpu-driver --open   switches back to the open-source driver." >&2
+    fi
+fi
+
 if [ -z "$TARGET_KVER" ]; then
     echo "maze-sb-sign: ERROR - no installed kernel found under /usr/lib/modules" >&2
     status_ok=0

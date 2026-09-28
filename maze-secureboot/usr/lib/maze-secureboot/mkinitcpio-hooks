@@ -1,0 +1,112 @@
+#!/bin/sh
+# Managed by Maze Linux. Disables Arch's mkinitcpio pacman hooks on an installed
+# Maze system, so the Unified Kernel Image has exactly ONE build path.
+#
+#   mkinitcpio-hooks apply    mask when safe, unmask when no longer safe
+#   mkinitcpio-hooks remove   unmask unconditionally (package removal)
+#   mkinitcpio-hooks status   print masked / unmasked / mixed, exit 0
+#
+# WHY
+# ---
+# On Maze the UKI is built by 85-maze-kernel-install.hook -> `kernel-install add`
+# -> 50-mkinitcpio.install -> ukify, and signed by 95-maze-sb-sign. Arch's
+# 90-mkinitcpio-install.hook reacts to the same package changes but drives the
+# PRESETS, which the installer empties (calamares-mount-api.sh). Kept alive only
+# by that emptiness it was a second, parallel build path that:
+#   * printed a "Preset file is empty" WARNING plus the Maze NOTE for every
+#     kernel on every kernel/systemd/firmware update, burying the output of the
+#     hook that actually builds the boot image;
+#   * came back on its own the moment a preset was regenerated from Arch's
+#     template — a new kernel package (linux-zen), a reinstalled mkinitcpio, a
+#     deleted preset — and then copied vmlinuz + initramfs images onto the
+#     FAT32 ESP, or aborted the whole hook on a missing ALL_kver path.
+# Masking it with a /dev/null symlink in /etc/pacman.d/hooks is pacman's own
+# mechanism for this (alpm-hooks(5)): a same-named file in the higher-priority
+# directory overrides /usr/share/libalpm/hooks, and /dev/null disables it.
+# 60-mkinitcpio-remove.hook goes with it: with empty presets it deletes nothing,
+# and maze-sb-sign already removes the UKI of an uninstalled kernel.
+#
+# WHEN IT IS SAFE — decided from the presets, never assumed
+# ---------------------------------------------------------
+# Masking is applied only if at least one preset exists AND every
+# /etc/mkinitcpio.d/*.preset carries PRESETS=(). That is precisely the
+# installed-Maze state. It is NOT the state of:
+#   * the ISO build: mkarchiso runs pacstrap with the airootfs hook directory
+#     and relies on 90-mkinitcpio-install to build the live initramfs from
+#     archiso's non-empty linux.preset. maze-secureboot is installed there too,
+#     so masking unconditionally would ship an ISO without an initramfs;
+#   * the booted live ISO (same archiso preset);
+#   * a machine whose admin restored a conventional preset.
+# In those states `apply` removes any mask this script set, so Arch's hook is
+# back exactly when something needs it. It never replaces an existing regular
+# file at the hook path (an admin's own override), only a /dev/null symlink.
+#
+# MAZE_ROOT (default empty) prefixes every path — for tests only.
+set -u
+
+ROOT="${MAZE_ROOT:-}"
+HOOKDIR="${ROOT}/etc/pacman.d/hooks"
+PRESETDIR="${ROOT}/etc/mkinitcpio.d"
+HOOKS="90-mkinitcpio-install.hook 60-mkinitcpio-remove.hook"
+SELF=maze-secureboot
+
+is_mask() { [ -L "$1" ] && [ "$(readlink "$1")" = /dev/null ]; }
+
+presets_all_empty() {
+    n=0
+    for p in "${PRESETDIR}"/*.preset; do
+        [ -f "$p" ] || continue
+        n=$((n + 1))
+        grep -qE '^[[:space:]]*PRESETS=\(\)[[:space:]]*$' "$p" || return 1
+    done
+    [ "$n" -gt 0 ]
+}
+
+mask() {
+    mkdir -p "${HOOKDIR}"
+    for h in ${HOOKS}; do
+        f="${HOOKDIR}/${h}"
+        is_mask "$f" && continue
+        if [ -e "$f" ] || [ -L "$f" ]; then
+            echo ">> ${SELF}: ${f#"${ROOT}"} exists and is not a /dev/null mask — left alone" >&2
+            continue
+        fi
+        ln -s /dev/null "$f" && echo ">> ${SELF}: disabled ${h} (the UKI is built by 85-maze-kernel-install.hook)"
+    done
+}
+
+unmask() {
+    for h in ${HOOKS}; do
+        f="${HOOKDIR}/${h}"
+        is_mask "$f" || continue
+        rm -f "$f" && echo ">> ${SELF}: re-enabled ${h}"
+    done
+}
+
+case "${1:-}" in
+    apply)
+        if presets_all_empty; then
+            mask
+        else
+            unmask
+        fi
+        ;;
+    remove)
+        unmask
+        ;;
+    status)
+        m=0; t=0
+        for h in ${HOOKS}; do
+            t=$((t + 1)); is_mask "${HOOKDIR}/${h}" && m=$((m + 1))
+        done
+        if [ "$m" -eq "$t" ]; then echo masked
+        elif [ "$m" -eq 0 ]; then echo unmasked
+        else echo mixed
+        fi
+        ;;
+    *)
+        echo "usage: ${0##*/} apply|remove|status" >&2
+        exit 2
+        ;;
+esac
+exit 0

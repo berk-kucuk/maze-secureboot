@@ -178,6 +178,16 @@ PRESETNOTE
     done
 }
 
+# One UKI build path: disable Arch's 90-mkinitcpio-install / 60-mkinitcpio-remove
+# hooks when (and only when) every preset is Maze's empty one — see the header of
+# /usr/lib/maze-secureboot/mkinitcpio-hooks for why, and for why the same call is
+# a no-op during the ISO build. Runs AFTER _add_preset_notice so it judges the
+# presets as they will stay. Never fails the transaction.
+_mkinitcpio_hooks() {
+    [ -x /usr/lib/maze-secureboot/mkinitcpio-hooks ] || return 0
+    /usr/lib/maze-secureboot/mkinitcpio-hooks "$1" || true
+}
+
 # The NvPCR units are skipped from now on (see the 10-maze-no-nvpcr.conf
 # drop-ins), but on a machine that already booted with systemd >= 262 they are
 # sitting in "failed" and the system says "degraded" until the next boot. The
@@ -195,6 +205,7 @@ post_install() {
     _clear_nvpcr_failures
     _check_layout
     _add_preset_notice
+    _mkinitcpio_hooks apply
 
     # One-time full repair. This is the moment we take over a machine whose
     # signing may have been silently failing, so rebuild the UKI for every
@@ -227,6 +238,7 @@ post_upgrade() {
     _clear_nvpcr_failures
     _check_layout
     _add_preset_notice
+    _mkinitcpio_hooks apply
 
     # Hand the re-sign to the self-heal unit with --no-block so it runs AFTER
     # this transaction. Doing it inline would race the kernel hooks in the same
@@ -240,6 +252,13 @@ post_upgrade() {
     echo ">>   it to the firmware boot menu. Pick 'Maze Linux (recovery kernel)'"
     echo ">>   from the boot menu (F12 on most machines) when the normal one fails."
     echo ">>   Verify it with: sudo maze-boot-check"
+}
+
+pre_remove() {
+    # Here, not in post_remove: by then the helper is already deleted. Leaving
+    # the masks behind would disable Arch's hook with nothing left that builds
+    # a boot image at all.
+    _mkinitcpio_hooks remove
 }
 
 post_remove() {

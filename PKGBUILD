@@ -38,8 +38,8 @@
 # /usr/local/bin paths so nothing that still references them can break.
 
 pkgname=maze-secureboot
-pkgver=1.2.0
-pkgrel=19
+pkgver=2.0.0
+pkgrel=2
 pkgdesc="Maze Linux Secure Boot chain — UKI rebuild, MOK signing, and a boot-chain check that blocks unsafe reboots"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"
@@ -94,6 +94,7 @@ package() {
             "${pkgdir}"/usr/bin/maze-boot-guard \
             "${pkgdir}"/usr/bin/maze-boot-notify \
             "${pkgdir}"/usr/bin/maze-boot-entries \
+            "${pkgdir}"/usr/lib/maze-secureboot/mkinitcpio-hooks \
             "${pkgdir}"/usr/lib/kernel/install.d/95-maze-sb-sign.install
   chmod 644 "${pkgdir}"/usr/share/libalpm/hooks/* \
             "${pkgdir}"/usr/lib/systemd/system/maze-sb-resign.* \
