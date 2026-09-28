@@ -29,6 +29,7 @@ done
 echo ">> building maze-secureboot with makepkg…"
 makepkg -f --nodeps
 
+# shellcheck disable=SC2012  # makepkg names are plain ASCII; ls -t picks the newest
 PKGFILE=$(ls -t maze-secureboot-*.pkg.tar.* 2>/dev/null | head -1 || true)
 [ -n "$PKGFILE" ] || { echo "build.sh: no package produced" >&2; exit 1; }
 echo ">> built: $PKGFILE"

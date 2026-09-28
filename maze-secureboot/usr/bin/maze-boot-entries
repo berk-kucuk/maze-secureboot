@@ -74,7 +74,6 @@ RAW="$(efibootmgr -v 2>/dev/null)" || {
     echo "maze-boot-entries: could not read the firmware boot entries" >&2; exit 1; }
 
 CURRENT="$(printf '%s\n' "$RAW" | sed -n 's/^BootCurrent: *//p' | tr -d '[:space:]')"
-ORDER="$(printf '%s\n' "$RAW" | sed -n 's/^BootOrder: *//p' | tr -d '[:space:]')"
 
 # The ESP this running system boots from. Entries pointing at a different
 # partition that still holds a loader belong to another Maze installation —
@@ -82,7 +81,7 @@ ORDER="$(printf '%s\n' "$RAW" | sed -n 's/^BootOrder: *//p' | tr -d '[:space:]')
 OUR_ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
 [ -n "$OUR_ESP" ] || OUR_ESP=/boot
 OUR_GUID="$(lsblk -rno PARTUUID "$(findmnt -no SOURCE "$OUR_ESP" 2>/dev/null)" 2>/dev/null \
-            | head -n 1 | tr 'A-Z' 'a-z' || true)"
+            | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
 
 is_maze_label() {
     printf '%s\n' "$LABELS" | grep -Fxq "$1"
@@ -91,7 +90,7 @@ is_maze_label() {
 # The HD(...) partition GUID of one entry's device path, lowercased.
 path_guid() {
     printf '%s\n' "$1" | sed -n 's/.*HD([0-9]*,GPT,\([0-9a-fA-F-]*\),.*/\1/p' \
-        | tr 'A-Z' 'a-z' | head -n 1
+        | tr '[:upper:]' '[:lower:]' | head -n 1
 }
 
 # The loader path, as a path relative to the partition root. Older efibootmgr
@@ -101,6 +100,7 @@ path_guid() {
 # verify - kept" and --clean could never remove anything (found by running the
 # tool on real hardware, 14 Sep 2026). Both forms are accepted now.
 path_file() {
+    # shellcheck disable=SC1003  # tr '\\' is a literal backslash, not an escaped quote
     printf '%s\n' "$1" | sed -n \
         -e 's/.*[)/]File(\([^)]*\)).*/\1/p' \
         -e 's/.*)\/\(\\[^[:space:]]*\).*/\1/p' \

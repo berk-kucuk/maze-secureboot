@@ -11,7 +11,9 @@ KEY="$KEYDIR/MOK.key"
 CRT="$KEYDIR/MOK.crt"
 CER="$KEYDIR/MOK.cer"
 
-[ -r "$KEY" ] && [ -r "$CRT" ] || { echo "maze-sb-sign: no MOK key, skipping" >&2; exit 0; }
+if [ ! -r "$KEY" ] || [ ! -r "$CRT" ]; then
+    echo "maze-sb-sign: no MOK key, skipping" >&2; exit 0
+fi
 
 # Serialize all invocations. This script is triggered from up to three
 # independent, overlapping sources for a single kernel update — the
@@ -425,7 +427,8 @@ fi
 boot_path="$(bootctl --print-boot-path 2>/dev/null || true)"
 dirs="$ESP"
 for d in "$boot_path" /boot /efi; do
-    [ -n "$d" ] && [ -d "$d" ] || continue
+    [ -n "$d" ] || continue
+    [ -d "$d" ] || continue
     case " $dirs " in *" $d "*) ;; *) dirs="$dirs $d" ;; esac
 done
 # Loose /boot/vmlinuz-<pkgbase> files are written by mkinitcpio's pacman hook

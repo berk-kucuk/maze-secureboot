@@ -30,7 +30,8 @@ if [ "$all" = 1 ]; then
     # a removed kernel's DKMS modules must not get a UKI.
     kvers=""
     for d in /usr/lib/modules/*/; do
-        [ -f "${d}pkgbase" ] && [ -f "${d}vmlinuz" ] || continue
+        [ -f "${d}pkgbase" ] || continue
+        [ -f "${d}vmlinuz" ] || continue
         k="${d%/}"; kvers="$kvers ${k##*/}"
     done
     [ -n "$kvers" ] && echo "maze-kernel-install-add: boot-image contents changed — rebuilding the UKI for:$kvers"
