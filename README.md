@@ -203,3 +203,9 @@ the pin) work.
 Out-of-tree modules (nvidia, dkms) are not signed. That is harmless while the
 Arch kernel does not enforce lockdown, but it would break those modules if
 upstream ever enables it under Secure Boot.
+
+## License
+
+Copyright © 2026 Berk Küçük
+
+Released under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
