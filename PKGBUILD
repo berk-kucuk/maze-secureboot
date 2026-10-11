@@ -38,8 +38,8 @@
 # /usr/local/bin paths so nothing that still references them can break.
 
 pkgname=maze-secureboot
-pkgver=2.0.0
-pkgrel=2
+pkgver=2.0.1
+pkgrel=1
 pkgdesc="Maze Linux Secure Boot chain — UKI rebuild, MOK signing, and a boot-chain check that blocks unsafe reboots"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"
@@ -47,13 +47,13 @@ license=('GPL3')
 depends=(
   'systemd'          # kernel-install, bootctl, the systemd EFI stub
   'systemd-ukify'    # ukify — kernel-install's 60-ukify.install plugin (layout=uki)
-  'sbsigntools'      # sbsign / sbverify
+  'sbsigntools'      # sbsign / sbverify / sbattach
   'binutils'         # objcopy — reads the UKI's PE .uname section (fallback match)
   'util-linux'       # flock — serialises the overlapping signer invocations
   'mkinitcpio'       # initramfs generator kernel-install's 50-mkinitcpio.install drives
 )
 optdepends=(
-  'mokutil: enrol the machine MOK key, and let maze-boot-check read the Secure Boot state'
+  'mokutil: enrol the machine MOK key, let maze-boot-check read the Secure Boot state, and maze-sb-rotate-key'
   'libnotify: desktop warning at login when the boot chain is unsafe'
   'shim-signed: the Microsoft-signed first stage (installed by the ISO into /var/lib/maze-secureboot)'
   'efibootmgr: create/inspect the "Maze Linux" NVRAM boot entry'
@@ -88,6 +88,7 @@ package() {
   # Normalise permissions: every helper and the kernel-install plugin must be
   # executable, everything else is plain data.
   chmod 755 "${pkgdir}"/usr/bin/maze-sb-sign \
+            "${pkgdir}"/usr/bin/maze-sb-rotate-key \
             "${pkgdir}"/usr/bin/maze-kernel-install-add \
             "${pkgdir}"/usr/bin/maze-initramfs-rebuild \
             "${pkgdir}"/usr/bin/maze-boot-check \
@@ -95,6 +96,7 @@ package() {
             "${pkgdir}"/usr/bin/maze-boot-notify \
             "${pkgdir}"/usr/bin/maze-boot-entries \
             "${pkgdir}"/usr/lib/maze-secureboot/mkinitcpio-hooks \
+            "${pkgdir}"/usr/lib/kernel/install.d/85-maze-sb-trust.install \
             "${pkgdir}"/usr/lib/kernel/install.d/95-maze-sb-sign.install
   chmod 644 "${pkgdir}"/usr/share/libalpm/hooks/* \
             "${pkgdir}"/usr/lib/systemd/system/maze-sb-resign.* \

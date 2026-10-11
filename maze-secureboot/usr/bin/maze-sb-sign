@@ -11,6 +11,84 @@ KEY="$KEYDIR/MOK.key"
 CRT="$KEYDIR/MOK.crt"
 CER="$KEYDIR/MOK.cer"
 
+# --- Which UKIs may be signed at all ----------------------------------------
+# The ESP is an unencrypted FAT partition: anyone with the disk in hand can drop
+# a file into EFI/Linux, or edit the UKI already there (swap its initrd). This
+# script runs on every boot and on every change to that directory, and it used
+# to sign EVERY *.efi it found there — including a modified UKI, whose broken
+# signature simply made it "need signing" — and then installed it as
+# grubx64.efi. That turned the MOK key into a signing service for whoever could
+# write to the ESP, i.e. a full Secure Boot bypass.
+#
+# Neither the file name nor the PE .uname section helps: both are written by
+# the same person who wrote the file. The only trustworthy witness is the moment
+# the UKI is BUILT. 85-maze-sb-trust.install runs inside `kernel-install add`,
+# after ukify has produced the image in kernel-install's private staging
+# directory and before 90-uki-copy.install copies it to the ESP, and records
+# its sha256 and kernel version here — on the root filesystem, next to the key,
+# where an attacker who cannot read the key cannot write either.
+#
+# A UKI is signed only when its exact bytes are in this list AND its kernel is
+# installed (/usr/lib/modules/<kver>/vmlinuz). Anything else is reported and
+# left alone — never signed, never deleted, never installed as grubx64.efi.
+TRUST_DB="$KEYDIR/trusted-ukis"
+
+# kernel-install's KERNEL_VERSION: a plain token, never a path or a field
+# separator, since it ends up in the list above and in /usr/lib/modules/<kver>.
+valid_kver() {
+    case "$1" in
+        ''|*/*|*[!A-Za-z0-9._+~-]*) return 1 ;;
+    esac
+    return 0
+}
+
+file_sha256() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# `maze-sb-sign --trust KVER FILE` — called only by 85-maze-sb-trust.install.
+# Handled before the MOK key check on purpose: during installation the UKI is
+# built (Calamares' bootloader module) before the per-machine key exists, and
+# that build still has to be recognised when the key is made and the first
+# signing run happens.
+if [ "${1:-}" = "--trust" ]; then
+    _tk="${2:-}"; _tf="${3:-}"
+    if ! valid_kver "$_tk" || [ ! -f "$_tf" ]; then
+        echo "maze-sb-sign: --trust needs a kernel version and an existing UKI" >&2
+        exit 2
+    fi
+    _ts="$(file_sha256 "$_tf")"
+    [ -n "$_ts" ] || { echo "maze-sb-sign: cannot hash $_tf" >&2; exit 1; }
+    mkdir -p /run/lock
+    exec 9>/run/lock/maze-sb-sign.lock
+    flock 9
+    # The key directory is root-only: the list says which images root's key
+    # will sign, so no one else may extend it.
+    ( umask 077; mkdir -p "$KEYDIR" )
+    _tmp="$TRUST_DB.tmp.$$"
+    # umask in the subshell that opens the file, so the list is created 0600.
+    ( umask 077; exec > "$_tmp"
+      # Keep at most the newest few builds per kernel: every kernel-install
+      # adds one, and an image that was replaced by a newer build of the same
+      # kernel has no business being signed later.
+      if [ -r "$TRUST_DB" ]; then
+          _n=0
+          # Newest entries are at the bottom; walk them in reverse.
+          sed -n '1!G;h;$p' "$TRUST_DB" | while read -r _s _k _rest; do
+              [ -n "$_s" ] && [ -n "$_k" ] || continue
+              [ "$_s" = "$_ts" ] && continue
+              if [ "$_k" = "$_tk" ]; then
+                  _n=$((_n + 1))
+                  [ "$_n" -lt 3 ] || continue
+              fi
+              printf '%s %s\n' "$_s" "$_k"
+          done | sed -n '1!G;h;$p'
+      fi
+      printf '%s %s\n' "$_ts" "$_tk"
+    ) || { rm -f "$_tmp"; echo "maze-sb-sign: could not write $TRUST_DB" >&2; exit 1; }
+    mv -f "$_tmp" "$TRUST_DB"
+    echo "maze-sb-sign: trusted new UKI build for kernel $_tk"
+    exit 0
+fi
+
 if [ ! -r "$KEY" ] || [ ! -r "$CRT" ]; then
     echo "maze-sb-sign: no MOK key, skipping" >&2; exit 0
 fi
@@ -87,6 +165,125 @@ sign_inplace() {
     fi
 }
 
+is_signed() { (sbverify --cert "$CRT" "$1") >/dev/null 2>&1; }
+
+# Number of Authenticode signatures in a PE image (0 when unsigned).
+signature_count() {
+    (sbverify --list "$1") 2>/dev/null | grep -c '^signature [0-9]' || true
+}
+
+# Remove every signature, in place. sbattach --remove takes off one per call.
+strip_signatures() {
+    _ss_n=0
+    while [ "$(signature_count "$1")" -gt 0 ]; do
+        _ss_n=$((_ss_n + 1))
+        [ "$_ss_n" -le 16 ] || return 1
+        sbattach --remove "$1" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
+# Kernel version recorded for these exact bytes, if kernel-install built them
+# on this machine. Prints nothing for an image nobody vouched for.
+trusted_kver() {
+    [ -r "$TRUST_DB" ] || return 0
+    _tv_sum="$(file_sha256 "$1")"
+    [ -n "$_tv_sum" ] || return 0
+    while read -r _tv_s _tv_k _tv_rest; do
+        if [ "$_tv_s" = "$_tv_sum" ] && valid_kver "$_tv_k"; then
+            printf '%s\n' "$_tv_k"
+            return 0
+        fi
+    done < "$TRUST_DB"
+    return 0
+}
+
+kver_installed() { valid_kver "$1" && [ -f "/usr/lib/modules/$1/vmlinuz" ]; }
+
+# May this UKI be booted / signed? Yes if our key already signed it (it was
+# vetted when it was signed — and an edited image no longer verifies), or if it
+# is a recorded build of a kernel that is installed. With a second argument,
+# a recorded build must also be a build of THAT kernel version.
+uki_acceptable() {
+    [ -f "$1" ] || return 1
+    is_signed "$1" && return 0
+    _ua_k="$(trusted_kver "$1")"
+    [ -n "$_ua_k" ] && kver_installed "$_ua_k" || return 1
+    [ -z "${2:-}" ] || [ "$_ua_k" = "$2" ]
+}
+
+refused_any=0
+# Sign a UKI only when uki_acceptable() says it is ours. Never deletes or
+# changes anything it refuses, and a refusal never fails the run on its own:
+# a file we did not make is not ours to judge beyond "do not sign it". (When
+# the image we NEED is the one refused, the boot-image step below fails loudly
+# instead, and leaves the working grubx64.efi in place.)
+sign_uki() {
+    _su_f="$1"
+    [ -f "$_su_f" ] || return 0
+    if is_signed "$_su_f"; then
+        echo "maze-sb-sign: OK     $_su_f"
+        return 0
+    fi
+    _su_k="$(trusted_kver "$_su_f")"
+    if [ -z "$_su_k" ]; then
+        echo "maze-sb-sign: REFUSED $_su_f" >&2
+        echo "maze-sb-sign:   not a UKI kernel-install built on this machine (unknown or modified content) — not signing it" >&2
+        refused_any=1
+        return 0
+    fi
+    if ! kver_installed "$_su_k"; then
+        echo "maze-sb-sign: REFUSED $_su_f (kernel $_su_k is not installed) — not signing it" >&2
+        refused_any=1
+        return 0
+    fi
+    sign_inplace "$_su_f"
+}
+
+# Drop list entries for kernels that are gone: their images are pruned below
+# and must not become signable again if the same bytes reappear.
+prune_trust_db() {
+    [ -s "$TRUST_DB" ] || return 0
+    _pt_tmp="$TRUST_DB.tmp.$$"
+    if ( umask 077; exec > "$_pt_tmp"
+         while read -r _pt_s _pt_k _pt_rest; do
+             [ -n "$_pt_s" ] || continue
+             kver_installed "$_pt_k" || continue
+             printf '%s %s\n' "$_pt_s" "$_pt_k"
+         done < "$TRUST_DB" ); then
+        if cmp -s "$_pt_tmp" "$TRUST_DB"; then
+            rm -f "$_pt_tmp"
+        else
+            mv -f "$_pt_tmp" "$TRUST_DB" || rm -f "$_pt_tmp"
+        fi
+    else
+        rm -f "$_pt_tmp"
+    fi
+    return 0
+}
+
+# A loose kernel (vmlinuz-<pkgbase>, a type-1 entry's <token>/<kver>/linux) is
+# signed only when it is byte-identical to a kernel a package installed under
+# /usr/lib/modules — the same rule, with the package as the witness.
+sign_loose_kernel() {
+    _sl_f="$1"
+    [ -f "$_sl_f" ] || return 0
+    if is_signed "$_sl_f"; then
+        echo "maze-sb-sign: OK     $_sl_f"
+        return 0
+    fi
+    for _sl_m in /usr/lib/modules/*/vmlinuz; do
+        [ -f "$_sl_m" ] || continue
+        if cmp -s "$_sl_f" "$_sl_m"; then
+            sign_inplace "$_sl_f"
+            return 0
+        fi
+    done
+    echo "maze-sb-sign: REFUSED $_sl_f (not identical to any installed kernel) — not signing it" >&2
+    refused_any=1
+    return 0
+}
+
 BOOTDIR="$ESP/EFI/BOOT"
 mkdir -p "$BOOTDIR"
 install_if_diff "$KEYDIR/shimx64.efi" "$BOOTDIR/BOOTX64.EFI"
@@ -146,18 +343,34 @@ kver_for_pkgbase() {
 
 # The kernel-install UKI for a version, named <entry-token>-<kver>.efi. If the
 # filename does not match (a custom entry_token, a hand-copied image) read the
-# version out of the PE .uname section, which is authoritative.
+# version out of the PE .uname section.
+#
+# Name and .uname only FIND candidates — anyone who can write to the ESP can set
+# both. A candidate is returned only if uki_acceptable() vouches for it, so a
+# planted "<x>-<kver>.efi" can neither become the boot image nor shadow the
+# real one (it used to win simply by sorting first). No acceptable image means
+# "no UKI", which every caller already handles without touching grubx64.efi.
+uki_uname() {
+    objcopy -O binary --only-section=.uname "$1" /dev/stdout 2>/dev/null \
+        | tr -d '\0' | tr -d '[:space:]'
+}
 find_uki() {
     _want="$1"
     for _f in "$ESP"/EFI/Linux/*"$_want".efi; do
-        [ -f "$_f" ] && { printf '%s\n' "$_f"; return 0; }
+        [ -f "$_f" ] || continue
+        # A name match whose .uname says another kernel is a renamed image.
+        if command -v objcopy >/dev/null 2>&1; then
+            _u="$(uki_uname "$_f")"
+            [ -z "$_u" ] || [ "$_u" = "$_want" ] || continue
+        fi
+        uki_acceptable "$_f" "$_want" && { printf '%s\n' "$_f"; return 0; }
     done
     command -v objcopy >/dev/null 2>&1 || return 1
     for _f in "$ESP"/EFI/Linux/*.efi; do
         [ -f "$_f" ] || continue
-        _u="$(objcopy -O binary --only-section=.uname "$_f" /dev/stdout 2>/dev/null \
-                | tr -d '\0' | tr -d '[:space:]')"
-        [ "$_u" = "$_want" ] && { printf '%s\n' "$_f"; return 0; }
+        _u="$(uki_uname "$_f")"
+        [ "$_u" = "$_want" ] || continue
+        uki_acceptable "$_f" "$_want" && { printf '%s\n' "$_f"; return 0; }
     done
     return 1
 }
@@ -301,8 +514,12 @@ fi
 # afterwards (in the safety-net loop at the end) changed the UKI's bytes after
 # the copy, which made every following run see a "new" UKI and rewrite
 # grubx64.efi again.
+#
+# Only images uki_acceptable() vouches for — a build kernel-install made here,
+# of a kernel that is installed. Everything else is reported and left alone.
+prune_trust_db
 for _f in "$ESP"/EFI/Linux/*.efi; do
-    sign_inplace "$_f"
+    sign_uki "$_f"
 done
 
 # --- Is grubx64.efi already current? ---------------------------------------
@@ -333,14 +550,39 @@ grub_is_current() {
     (sbverify --cert "$CRT" "$GRUB") >/dev/null 2>&1
 }
 
-if [ -n "$UKI" ] && grub_is_current; then
+if [ -n "$UKI" ] && ! uki_acceptable "$UKI" "$TARGET_KVER"; then
+    # Unreachable in practice — find_uki only returns a vouched-for image — but
+    # grubx64.efi is made by signing a COPY of $UKI, so this one check is what
+    # keeps it from ever being built out of something nobody vouched for. Even
+    # if the in-place signing above failed (ESP full), a vouched-for image still
+    # passes here, so a new kernel is never held back by that alone.
+    echo "maze-sb-sign: ERROR - $UKI is not a trusted image for kernel $TARGET_KVER; leaving $GRUB unchanged" >&2
+    status_ok=0
+elif [ -n "$UKI" ] && grub_is_current; then
     echo "maze-sb-sign: OK     $GRUB (kernel $TARGET_KVER, unchanged)"
 elif [ -n "$UKI" ]; then
     # Sign to a temp file and rename into place — never write $GRUB directly.
     # sbsign dying partway (disk full, killed mid-transaction) must not leave
     # a truncated/corrupt grubx64.efi with no working fallback, since it is the
     # ONLY thing shim chainloads.
-    if _sberr="$(sbsign --key "$KEY" --cert "$CRT" --output "$GRUB.maze-signed" "$UKI" 2>&1 >/dev/null)"; then
+    #
+    # Sign a copy with its existing signatures stripped. sbsign does not
+    # replace a signature, it APPENDS one, so signing the (already signed) UKI
+    # gave grubx64.efi two signatures — and after a key rotation
+    # (maze-sb-rotate-key) the first of them would be the retired key's, which
+    # a shim that checks only the first signature rejects. The stripped copy
+    # lives on the root filesystem, not the ESP, so it costs no ESP space; if
+    # it cannot be made, sign the UKI as before.
+    _grub_src="$UKI"
+    _strip_tmp=""
+    if signature_count "$UKI" | grep -q '^[1-9]' \
+       && _strip_tmp="$(mktemp /var/tmp/maze-sb-sign.XXXXXX 2>/dev/null)"; then
+        if cp -f "$UKI" "$_strip_tmp" 2>/dev/null && strip_signatures "$_strip_tmp"; then
+            _grub_src="$_strip_tmp"
+        fi
+    fi
+    if _sberr="$(sbsign --key "$KEY" --cert "$CRT" --output "$GRUB.maze-signed" "$_grub_src" 2>&1 >/dev/null)"; then
+        [ -z "$_strip_tmp" ] || rm -f "$_strip_tmp"
         # Keep the OUTGOING image as grubx64.efi.maze-prev. shim chainloads
         # grubx64.efi and nothing else — there is no systemd-boot menu and the
         # sd-boot NVRAM entry is deliberately removed — so until now a kernel
@@ -383,6 +625,7 @@ elif [ -n "$UKI" ]; then
         echo "maze-sb-sign: SIGNED $GRUB (from $UKI, kernel $TARGET_KVER)"
     else
         rm -f "$GRUB.maze-signed"
+        [ -z "$_strip_tmp" ] || rm -f "$_strip_tmp"
         echo "maze-sb-sign: FAIL signing $UKI as $GRUB" >&2
         [ -n "$_sberr" ] && printf '%s\n' "$_sberr" | sed 's/^/maze-sb-sign:   /' >&2
         status_ok=0
@@ -392,9 +635,11 @@ elif [ -n "$TARGET_KVER" ]; then
     # there" (what this branch used to do): that is what let a dead kernel stay
     # installed as the boot image while the run still reported success. Leave
     # the existing chain untouched — it may still be bootable — and fail loudly.
-    echo "maze-sb-sign: ERROR - no UKI on the ESP for the installed kernel $TARGET_KVER" >&2
+    # "No UKI" includes "a UKI nobody vouched for" (see find_uki): rebuilding
+    # through kernel-install records the new build, so the same fix covers both.
+    echo "maze-sb-sign: ERROR - no trusted UKI on the ESP for the installed kernel $TARGET_KVER" >&2
     echo "maze-sb-sign:         REFUSING to install a stale grubx64.efi (that is what bricks the boot)." >&2
-    echo "maze-sb-sign:         Rebuild it with:" >&2
+    echo "maze-sb-sign:         Your current grubx64.efi was left as it is. Rebuild the UKI with:" >&2
     echo "maze-sb-sign:           kernel-install add $TARGET_KVER /usr/lib/modules/$TARGET_KVER/vmlinuz" >&2
     status_ok=0
 fi
@@ -447,12 +692,25 @@ for d in $dirs; do
             rm -f "$f" && echo "maze-sb-sign: removed loose ${f##*/} (unused with layout=uki; the UKI carries the kernel)"
         done
     else
-        for f in "$d"/vmlinuz-*; do sign_inplace "$f"; done
+        for f in "$d"/vmlinuz-*; do sign_loose_kernel "$f"; done
     fi
-    for f in "$d"/EFI/Linux/*.efi "$d"/*/*/linux; do
-        sign_inplace "$f"
+    # Same rules as the main pass: UKIs only if vouched for, loose kernels only
+    # if identical to an installed one.
+    for f in "$d"/EFI/Linux/*.efi; do
+        sign_uki "$f"
+    done
+    for f in "$d"/*/*/linux; do
+        sign_loose_kernel "$f"
     done
 done
+
+if [ "$refused_any" = 1 ]; then
+    echo "maze-sb-sign: NOTE - some boot files were NOT signed (see REFUSED above). They were not" >&2
+    echo "maze-sb-sign:   built by kernel-install on this machine, or were changed afterwards, so" >&2
+    echo "maze-sb-sign:   Secure Boot will not run them. Nothing was deleted. If you did not put them" >&2
+    echo "maze-sb-sign:   there, someone with access to the disk may have. To rebuild a kernel's UKI:" >&2
+    echo "maze-sb-sign:     sudo maze-initramfs-rebuild" >&2
+fi
 
 # --- A second, firmware-selectable boot entry for the other kernel ----------
 #

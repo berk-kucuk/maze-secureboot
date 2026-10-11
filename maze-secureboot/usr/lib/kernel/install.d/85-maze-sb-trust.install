@@ -1,0 +1,37 @@
+#!/bin/sh
+# Managed by Maze Linux. Vouches for the UKI `kernel-install add` just built, so
+# maze-sb-sign will sign it — and nothing else.
+#
+# Runs after 60-ukify.install has written the image to kernel-install's private
+# staging directory and BEFORE 90-uki-copy.install copies it to the ESP. At this
+# point the bytes come straight from the kernel, initramfs and cmdline on the
+# root filesystem; once they reach the (unencrypted) ESP, anyone with the disk
+# could change them. maze-sb-sign compares what it finds on the ESP against the
+# sha256 recorded here and refuses to sign anything that does not match.
+#
+# Runs before 90 also for a second reason: maze-sb-resign.path fires the moment
+# the file appears on the ESP, and the image must already be known by then.
+#
+# Never fails kernel-install: if recording fails, maze-sb-sign refuses the image
+# and says how to rebuild it — the working grubx64.efi is kept meanwhile.
+set -eu
+[ "${1:-}" = "add" ] || exit 0
+KVER="${2:-}"
+IMAGE="${4:-}"
+[ -n "$KVER" ] || exit 0
+[ "${KERNEL_INSTALL_LAYOUT:-}" = "uki" ] || exit 0
+[ -x /usr/bin/maze-sb-sign ] || exit 0
+
+# The same choice 90-uki-copy.install makes: the staged uki.efi, or else a
+# ready-made UKI root passed to `kernel-install add` explicitly.
+SRC=""
+if [ -n "${KERNEL_INSTALL_STAGING_AREA:-}" ] && [ -f "$KERNEL_INSTALL_STAGING_AREA/uki.efi" ]; then
+    SRC="$KERNEL_INSTALL_STAGING_AREA/uki.efi"
+elif [ -n "$IMAGE" ] && [ "${IMAGE%.efi}" != "$IMAGE" ] && [ -f "$IMAGE" ]; then
+    SRC="$IMAGE"
+fi
+[ -n "$SRC" ] || exit 0
+
+/usr/bin/maze-sb-sign --trust "$KVER" "$SRC" >/dev/null 2>&1 \
+    || echo "85-maze-sb-trust: WARNING - could not record the new UKI for $KVER; maze-sb-sign will refuse to sign it" >&2
+exit 0

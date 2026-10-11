@@ -1,0 +1,445 @@
+#!/bin/sh
+# Managed by Maze Linux. Replaces this machine's Secure Boot (MOK) key, so that
+# every boot image ever signed with the old key stops booting.
+#
+# Usage: maze-sb-rotate-key [status|start|continue|cancel] [ESP_MOUNTPOINT]
+#
+# WHY
+#
+# MOK has no revocation list. Every image maze-sb-sign has ever signed — old
+# kernels, old initramfs builds — stays bootable through shim for as long as the
+# key that signed it is enrolled, and the ESP they lived on is unencrypted, so
+# anyone who once had the disk can keep copies. Retiring the key is the one way
+# to make all of them worthless at once.
+#
+# HOW, WITHOUT EVER LEAVING THE MACHINE UNBOOTABLE
+#
+# Enrolling and deleting MOK keys needs a person at the blue MokManager screen
+# on the next boot, so the rotation is done in stages, one reboot each. The rule
+# every stage keeps: the files shim boots are only ever signed with a key that
+# is ALREADY enrolled, and the old key is only removed once nothing needs it.
+#
+#   start     makes a new key and asks MokManager to ENROLL it. Nothing on the
+#             ESP changes. If the request is ignored or rejected, nothing at all
+#             has changed.
+#   continue  (after the reboot) checks the new key really is enrolled, then
+#             re-signs every boot image with it. Both keys are enrolled now, so
+#             the old and the new images both boot.
+#   continue  (after one more normal reboot, which proves the new images boot)
+#             re-checks every boot image and asks MokManager to DELETE the old
+#             key. Even if that request is ignored, everything keeps booting.
+#   continue  (after that reboot) confirms the old key is gone and removes it.
+#
+#   cancel    backs out of whichever stage is in progress.
+#
+# This tool never runs by itself; nothing in the package calls it.
+set -eu
+
+SELF=maze-sb-rotate-key
+KEYDIR=/var/lib/maze-secureboot
+KEY="$KEYDIR/MOK.key"
+CRT="$KEYDIR/MOK.crt"
+CER="$KEYDIR/MOK.cer"
+ROT="$KEYDIR/rotate"
+STATE="$ROT/state"
+LOCKFILE=/run/lock/maze-sb-sign.lock
+SIGNER=/usr/bin/maze-sb-sign
+
+say()  { echo "$SELF: $*"; }
+warn() { echo "$SELF: $*" >&2; }
+die()  { echo "$SELF: ERROR - $*" >&2; exit 1; }
+
+CMD="${1:-status}"
+ESP="${2:-}"
+
+case "$CMD" in
+    status|start|continue|cancel) ;;
+    -h|--help|help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown command '$CMD' (status|start|continue|cancel)" ;;
+esac
+
+[ "$(id -u)" = 0 ] || die "must be run as root (sudo $SELF $CMD)"
+
+for _t in mokutil openssl sbsign sbverify sbattach flock; do
+    command -v "$_t" >/dev/null 2>&1 || die "'$_t' is not installed"
+done
+[ -x "$SIGNER" ] || die "$SIGNER is missing"
+
+if [ -z "$ESP" ]; then
+    ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+    [ -n "${ESP:-}" ] && [ -d "$ESP" ] || ESP=/efi
+    [ -d "$ESP" ] || ESP=/boot
+fi
+[ -d "$ESP/EFI" ] || die "no EFI directory under '$ESP' (pass the ESP mount point as the 2nd argument)"
+
+state() { tr -d '[:space:]' < "$STATE" 2>/dev/null || true; }
+set_state() { ( umask 077; printf '%s\n' "$1" > "$STATE.tmp" ) && mv -f "$STATE.tmp" "$STATE"; }
+boot_id() { tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true; }
+
+# --- MOK queries -------------------------------------------------------------
+enrolled() { mokutil --test-key "$1" 2>/dev/null | grep -qi 'is already enrolled'; }
+sb_enabled() { mokutil --sb-state 2>/dev/null | grep -qi 'secureboot[[:space:]]*enabled'; }
+sha1_of() { openssl x509 -inform DER -in "$1" -noout -fingerprint -sha1 2>/dev/null \
+                | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F'; }
+# mokutil prints fingerprints with colons and in lower case.
+listed_in() { # cert-der  --list-new|--list-delete
+    _li_fp="$(sha1_of "$1")"
+    [ -n "$_li_fp" ] || return 1
+    mokutil "$2" 2>/dev/null | sed 's/://g' | tr 'a-f' 'A-F' | grep -q "$_li_fp"
+}
+any_pending() {
+    mokutil --list-new 2>/dev/null | grep -qi 'fingerprint' && return 0
+    mokutil --list-delete 2>/dev/null | grep -qi 'fingerprint' && return 0
+    return 1
+}
+
+# --- signatures ----------------------------------------------------------------
+verifies() { (sbverify --cert "$2" "$1") >/dev/null 2>&1; }
+signature_count() { (sbverify --list "$1") 2>/dev/null | grep -c '^signature [0-9]' || true; }
+strip_signatures() {
+    _ss_n=0
+    while [ "$(signature_count "$1")" -gt 0 ]; do
+        _ss_n=$((_ss_n + 1))
+        [ "$_ss_n" -le 16 ] || return 1
+        sbattach --remove "$1" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
+# Everything shim can be pointed at that maze-sb-sign signs. BOOTX64.EFI and
+# mmx64.efi are shim and MokManager themselves — Microsoft-signed, not ours.
+BOOT_FILES='EFI/Linux/*.efi EFI/BOOT/grubx64.efi EFI/BOOT/grubx64.efi.maze-prev EFI/maze-recovery/grubx64.efi'
+
+# Re-sign one image from the key FROM to the key TO, keeping ONLY the new
+# signature (sbsign appends, so the old signatures are stripped first). The
+# file is replaced by rename only once the result verifies with TO and no
+# longer with FROM; on any failure it is left exactly as it was — still signed
+# with FROM, which is still enrolled whenever this runs, so it still boots.
+resign_one() { # file from-crt to-key to-crt
+    _r_f="$1"
+    if ! verifies "$_r_f" "$2"; then
+        return 0          # not ours under FROM: never touched here
+    fi
+    if verifies "$_r_f" "$4" && [ "$(signature_count "$_r_f")" = 1 ]; then
+        return 0          # already done
+    fi
+    _r_t="$_r_f.maze-rotate"
+    rm -f "$_r_t" "$_r_t.signed"
+    if cp -f "$_r_f" "$_r_t" && strip_signatures "$_r_t" \
+       && sbsign --key "$3" --cert "$4" --output "$_r_t.signed" "$_r_t" >/dev/null 2>&1 \
+       && verifies "$_r_t.signed" "$4" && ! verifies "$_r_t.signed" "$2" \
+       && mv -f "$_r_t.signed" "$_r_f"; then
+        rm -f "$_r_t"
+        say "re-signed ${_r_f#"$ESP"/}"
+        return 0
+    fi
+    rm -f "$_r_t" "$_r_t.signed"
+    warn "could not re-sign ${_r_f#"$ESP"/} (ESP full?) — it keeps its old signature and still boots"
+    return 1
+}
+
+resign_all() { # from-crt to-key to-crt
+    _ra_fail=0
+    for _ra_p in $BOOT_FILES; do
+        for _ra_f in "$ESP"/$_ra_p; do
+            [ -f "$_ra_f" ] || continue
+            resign_one "$_ra_f" "$1" "$2" "$3" || _ra_fail=1
+        done
+    done
+    sync
+    return "$_ra_fail"
+}
+
+# Install a key pair as the machine key. Each file goes in by rename, so no
+# reader ever sees a half-written key.
+install_keypair() { # key crt cer
+    ( umask 077
+      cp -f "$1" "$KEY.tmp" && cp -f "$2" "$CRT.tmp" && cp -f "$3" "$CER.tmp" ) || return 1
+    chmod 600 "$KEY.tmp"; chmod 644 "$CRT.tmp" "$CER.tmp"
+    mv -f "$KEY.tmp" "$KEY" && mv -f "$CRT.tmp" "$CRT" && mv -f "$CER.tmp" "$CER"
+}
+
+lock()   { mkdir -p /run/lock; exec 9>"$LOCKFILE"; flock 9; }
+unlock() { exec 9>&-; }
+
+run_signer() { # extra args...
+    if "$SIGNER" "$@" "$ESP"; then return 0; fi
+    return 1
+}
+
+# --- DKMS modules signed with the old key -------------------------------------
+# The kernel only trusts module signatures from enrolled keys. Arch does not
+# enforce module signatures, so after the old key is deleted a module it signed
+# still loads (the kernel is just marked "tainted") — but with lockdown or
+# module.sig_enforce=1 it would NOT load, which for the NVIDIA driver means no
+# display. Those cases must be rebuilt first.
+norm_hex() { tr -d ':[:space:]' | tr 'a-f' 'A-F' | sed 's/^0*//'; }
+old_signed_modules() { # old-crt
+    _om_serial="$(openssl x509 -in "$1" -noout -serial 2>/dev/null | sed 's/.*=//' | norm_hex)"
+    _om_skid="$(openssl x509 -in "$1" -noout -ext subjectKeyIdentifier 2>/dev/null | tail -1 | norm_hex)"
+    command -v modinfo >/dev/null 2>&1 || return 0
+    for _om_m in /usr/lib/modules/*/updates/*.ko* /usr/lib/modules/*/updates/*/*.ko*; do
+        [ -f "$_om_m" ] || continue
+        _om_k="$(modinfo -F sig_key "$_om_m" 2>/dev/null | norm_hex)"
+        [ -n "$_om_k" ] || continue
+        if [ "$_om_k" = "$_om_serial" ] || { [ -n "$_om_skid" ] && [ "$_om_k" = "$_om_skid" ]; }; then
+            printf '%s\n' "$_om_m"
+        fi
+    done
+}
+module_sigs_enforced() {
+    grep -qw 'module.sig_enforce=1' /proc/cmdline 2>/dev/null && return 0
+    grep -q '^Y' /sys/module/module/parameters/sig_enforce 2>/dev/null && return 0
+    [ -r /sys/kernel/security/lockdown ] && ! grep -q '\[none\]' /sys/kernel/security/lockdown && return 0
+    return 1
+}
+
+# ==============================================================================
+cmd_status() {
+    _s="$(state)"
+    case "$_s" in
+        "")             say "no key rotation in progress." ;;
+        enroll-pending) say "stage 1 of 3: waiting for the NEW key to be enrolled."
+                        say "  Reboot, pick 'Enroll MOK' in the blue MokManager screen, enter the"
+                        say "  password you chose, then run: sudo $SELF continue" ;;
+        switched)       say "stage 2 of 3: boot images are signed with the NEW key; the old key is still enrolled."
+                        if [ "$(boot_id)" = "$(tr -d '[:space:]' < "$ROT/switch-boot-id" 2>/dev/null || true)" ]; then
+                            say "  Reboot once normally, then run: sudo $SELF continue"
+                        else
+                            say "  Run: sudo $SELF continue   (asks MokManager to delete the old key)"
+                        fi ;;
+        delete-pending) say "stage 3 of 3: waiting for the OLD key to be deleted."
+                        say "  Reboot, pick 'Delete MOK' in MokManager, enter the password, then run:"
+                        say "  sudo $SELF continue" ;;
+        *)              say "unknown state '$_s' in $STATE" ;;
+    esac
+}
+
+cmd_start() {
+    [ -z "$(state)" ] || { cmd_status; die "a rotation is already in progress"; }
+    [ -r "$KEY" ] && [ -r "$CRT" ] && [ -r "$CER" ] || die "this machine has no MOK key in $KEYDIR"
+    sb_enabled || die "Secure Boot is off. Old images are not blocked by anything then, so there is nothing to rotate for."
+    enrolled "$CER" || die "the current key is not enrolled — fix that first (maze-boot-check explains how)"
+    ! any_pending || die "MokManager already has a pending request (mokutil --list-new / --list-delete). Finish or revoke it first."
+
+    say "checking the current boot chain first..."
+    run_signer >/dev/null 2>&1 || die "maze-sb-sign reports problems — fix those before rotating (sudo maze-sb-sign)"
+
+    ( umask 077; mkdir -p "$ROT" )
+    rm -f "$ROT"/new.*
+    ( umask 077
+      openssl req -newkey rsa:2048 -nodes -keyout "$ROT/new.key" -new -x509 -sha256 -days 3650 \
+          -subj "/CN=Maze Linux Secure Boot machine key $(date +%Y-%m-%d)/" \
+          -out "$ROT/new.crt" >/dev/null 2>&1 \
+      && openssl x509 -outform DER -in "$ROT/new.crt" -out "$ROT/new.cer" >/dev/null 2>&1 ) \
+        || { rm -f "$ROT"/new.*; die "could not generate the new key"; }
+
+    say ""
+    say "mokutil will now ask for a one-time password. You type it ONCE MORE in the"
+    say "blue MokManager screen on the next boot — pick something short you will remember."
+    if ! mokutil --import "$ROT/new.cer"; then
+        rm -f "$ROT"/new.*
+        die "mokutil --import failed; nothing was changed"
+    fi
+    set_state enroll-pending
+    say ""
+    say "Done. Nothing on the ESP was changed; the machine boots exactly as before."
+    say "Next: reboot. In the blue MokManager screen choose:"
+    say "  Enroll MOK -> Continue -> Yes -> (password) -> Reboot"
+    say "Then run: sudo $SELF continue"
+    say "(If you skip the screen, nothing happens; run '$SELF cancel' to drop the request.)"
+}
+
+do_switch() {
+    enrolled "$ROT/new.cer" || die "internal: new key not enrolled"
+    enrolled "$ROT/old.cer" 2>/dev/null || enrolled "$CER" \
+        || die "the CURRENT key is no longer enrolled — refusing to touch anything"
+
+    lock
+    ( umask 077; cp -f "$KEY" "$ROT/old.key" && cp -f "$CRT" "$ROT/old.crt" && cp -f "$CER" "$ROT/old.cer" ) \
+        || { unlock; die "could not back up the current key; nothing was changed"; }
+    install_keypair "$ROT/new.key" "$ROT/new.crt" "$ROT/new.cer" \
+        || { install_keypair "$ROT/old.key" "$ROT/old.crt" "$ROT/old.cer" || true
+             unlock; die "could not install the new key; the old key is back in place"; }
+    printf '%s\n' "$(boot_id)" > "$ROT/switch-boot-id"
+    set_state switched
+    rm -f "$ROT/new.key"
+    say "the NEW key is now the machine key. Re-signing boot images (both keys are enrolled,"
+    say "so every image boots whichever key it carries)..."
+    _sw_ok=1
+    resign_all "$ROT/old.crt" "$KEY" "$CRT" || _sw_ok=0
+    unlock
+    run_signer --force-bootloader || _sw_ok=0
+
+    say ""
+    if [ "$_sw_ok" = 1 ]; then
+        say "Stage 2 done: the boot images are signed with the new key."
+    else
+        warn "Some images could not be re-signed yet (see above). They still boot with the"
+        warn "old key, which stays enrolled; '$SELF continue' retries them."
+    fi
+    if command -v dkms >/dev/null 2>&1; then
+        say "DKMS modules built from now on are signed with the new key."
+    fi
+    say "Next: reboot ONCE normally (this proves the new images boot), then run:"
+    say "  sudo $SELF continue"
+}
+
+do_request_delete() {
+    [ -r "$ROT/old.cer" ] && [ -r "$ROT/old.crt" ] || die "the backup of the old key is missing ($ROT/old.*)"
+
+    if ! enrolled "$ROT/old.cer"; then
+        say "the old key is no longer enrolled."
+        finish_cleanup
+        return 0
+    fi
+
+    lock
+    resign_all "$ROT/old.crt" "$KEY" "$CRT" || true
+    unlock
+    run_signer || die "maze-sb-sign reports problems — fix those first (sudo maze-sb-sign), then retry"
+
+    if [ "$(boot_id)" = "$(tr -d '[:space:]' < "$ROT/switch-boot-id" 2>/dev/null || true)" ]; then
+        die "reboot once first: the old key is only removed after the new images have booted this machine"
+    fi
+    sb_enabled || die "Secure Boot is off now, so the reboot proved nothing about the new images. Turn it back on, reboot, and retry."
+    enrolled "$CER" || die "the NEW key is not enrolled any more — refusing to delete the old one"
+
+    # Every file shim can boot must carry the new signature and no trace of the
+    # old one: a shim that checks only the FIRST signature would reject an image
+    # whose first signature belongs to a deleted key.
+    _rd_bad=0
+    for _rd_p in $BOOT_FILES; do
+        for _rd_f in "$ESP"/$_rd_p; do
+            [ -f "$_rd_f" ] || continue
+            if verifies "$_rd_f" "$ROT/old.crt"; then
+                warn "still signed with the OLD key: ${_rd_f#"$ESP"/}"
+                _rd_bad=1
+            fi
+        done
+    done
+    for _rd_f in "$ESP/EFI/BOOT/grubx64.efi" "$ESP/EFI/BOOT/grubx64.efi.maze-prev" "$ESP/EFI/maze-recovery/grubx64.efi"; do
+        [ -f "$_rd_f" ] || continue
+        if ! verifies "$_rd_f" "$CRT"; then
+            warn "not signed with the NEW key: ${_rd_f#"$ESP"/}"
+            _rd_bad=1
+        fi
+    done
+    [ -f "$ESP/EFI/BOOT/grubx64.efi" ] || { warn "EFI/BOOT/grubx64.efi is missing"; _rd_bad=1; }
+    [ "$_rd_bad" = 0 ] || die "not removing the old key until every boot image is signed with the new one only (free ESP space, run '$SELF continue' again)"
+
+    _rd_mods="$(old_signed_modules "$ROT/old.crt")"
+    if [ -n "$_rd_mods" ]; then
+        if module_sigs_enforced; then
+            warn "these kernel modules are signed with the old key, and this kernel ENFORCES"
+            warn "module signatures — they would stop loading:"
+            printf '%s\n' "$_rd_mods" | sed "s/^/$SELF:   /" >&2
+            die "rebuild them first (for DKMS: sudo dkms autoinstall --force), then retry"
+        fi
+        say "NOTE: these modules are signed with the old key. They keep loading after it is"
+        say "deleted (this kernel does not enforce module signatures; it only logs a taint):"
+        printf '%s\n' "$_rd_mods" | sed "s/^/$SELF:   /"
+        say "They are re-signed with the new key the next time DKMS rebuilds them."
+    fi
+
+    say ""
+    say "Every boot image is signed with the new key only. mokutil will now ask for a"
+    say "one-time password again, for the 'Delete MOK' screen on the next boot."
+    mokutil --delete "$ROT/old.cer" || die "mokutil --delete failed; nothing was changed (still boots)"
+    set_state delete-pending
+    say ""
+    say "Next: reboot. In MokManager choose:"
+    say "  Delete MOK -> Continue -> Yes -> (password) -> Reboot"
+    say "Then run: sudo $SELF continue"
+    say "(If you skip it, nothing breaks: both keys stay enrolled and the machine boots.)"
+}
+
+finish_cleanup() {
+    rm -f "$ROT/old.key" "$ROT/old.crt" "$ROT/old.cer" "$ROT/new.crt" "$ROT/new.cer" \
+          "$ROT/new.key" "$ROT/switch-boot-id" "$STATE"
+    rmdir "$ROT" 2>/dev/null || true
+    say "Rotation complete. Images signed with the old key no longer boot on this machine."
+}
+
+cmd_continue() {
+    case "$(state)" in
+        "")
+            say "no key rotation in progress (start one with: sudo $SELF start)" ;;
+        enroll-pending)
+            if enrolled "$ROT/new.cer"; then
+                do_switch
+            elif listed_in "$ROT/new.cer" --list-new; then
+                say "the new key is still waiting for confirmation. Reboot and pick 'Enroll MOK'"
+                say "in the blue MokManager screen (it is shown only for a few seconds)."
+            else
+                warn "the new key was not enrolled and the request is gone (rejected, wrong"
+                warn "password, or timed out). Nothing was changed. Start again with:"
+                warn "  sudo $SELF cancel && sudo $SELF start"
+                exit 1
+            fi ;;
+        switched)
+            do_request_delete ;;
+        delete-pending)
+            if ! enrolled "$ROT/old.cer"; then
+                finish_cleanup
+            elif listed_in "$ROT/old.cer" --list-delete; then
+                say "the old key is still waiting to be deleted. Reboot and pick 'Delete MOK'."
+            else
+                set_state switched
+                warn "the delete request was not confirmed (nothing changed; everything boots)."
+                warn "Run 'sudo $SELF continue' to ask again."
+                exit 1
+            fi ;;
+        *)
+            die "unknown state in $STATE" ;;
+    esac
+}
+
+cmd_cancel() {
+    case "$(state)" in
+        "")
+            say "no key rotation in progress." ;;
+        enroll-pending)
+            if enrolled "$ROT/new.cer"; then
+                warn "the new key is ALREADY enrolled; it is harmless while no image uses it."
+                warn "To remove it as well: sudo mokutil --delete $ROT/new.cer  (before this command)"
+            elif listed_in "$ROT/new.cer" --list-new; then
+                mokutil --revoke-import || die "mokutil --revoke-import failed"
+            fi
+            rm -f "$ROT"/new.* "$STATE"
+            rmdir "$ROT" 2>/dev/null || true
+            say "cancelled. Nothing on the ESP was ever changed." ;;
+        switched)
+            [ -r "$ROT/old.key" ] && [ -r "$ROT/old.crt" ] && [ -r "$ROT/old.cer" ] \
+                || die "the backup of the old key is missing; cannot switch back"
+            enrolled "$ROT/old.cer" || die "the old key is no longer enrolled; switching back would not boot"
+            lock
+            ( umask 077; cp -f "$CRT" "$ROT/abandoned.crt" && cp -f "$CER" "$ROT/abandoned.cer" ) || true
+            install_keypair "$ROT/old.key" "$ROT/old.crt" "$ROT/old.cer" \
+                || { unlock; die "could not restore the old key"; }
+            set_state cancelling
+            resign_all "$ROT/abandoned.crt" "$KEY" "$CRT" || true
+            unlock
+            run_signer --force-bootloader || warn "maze-sb-sign reported problems (see above)"
+            rm -f "$ROT/old.key" "$ROT/old.crt" "$ROT/old.cer" "$ROT/switch-boot-id" "$STATE"
+            say "switched back to the old key. The new key is still enrolled but unused; to"
+            say "remove it too: sudo mokutil --delete $ROT/abandoned.cer   (then confirm on reboot)" ;;
+        delete-pending)
+            if listed_in "$ROT/old.cer" --list-delete; then
+                mokutil --revoke-delete || die "mokutil --revoke-delete failed"
+            fi
+            set_state switched
+            say "delete request withdrawn. Both keys stay enrolled; '$SELF cancel' again switches back." ;;
+        cancelling)
+            die "a previous cancel was interrupted; run 'sudo maze-sb-sign --force-bootloader' and remove $STATE" ;;
+        *)
+            die "unknown state in $STATE" ;;
+    esac
+}
+
+case "$CMD" in
+    status)   cmd_status ;;
+    start)    cmd_start ;;
+    continue) cmd_continue ;;
+    cancel)   cmd_cancel ;;
+esac

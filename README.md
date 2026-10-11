@@ -30,6 +30,8 @@ this package, so every existing Maze install picks it up on the next
 | `/usr/bin/maze-kernel-install-add` | Runs `kernel-install add` for each upgraded kernel — the step stock Arch never performs. |
 | `/usr/share/libalpm/hooks/85-maze-kernel-install.hook` | Fires on `usr/lib/modules/*/vmlinuz`; rebuilds the UKI **before** the re-sign pass. |
 | `/usr/share/libalpm/hooks/zz-maze-secureboot.hook` | Idempotent re-sign after kernel/nvidia/dkms/mkinitcpio/systemd changes. |
+| `/usr/bin/maze-sb-rotate-key` | Opt-in, never run automatically. Replaces the machine MOK key so every image ever signed with the old one stops booting (MOK has no revocation list). Staged `start` → `continue` → `continue` → `continue`, one MokManager confirmation and reboot per stage; boot images are only ever signed with an already-enrolled key, and the old key is deleted only after the new images have booted. `cancel` backs out of any stage. |
+| `/usr/lib/kernel/install.d/85-maze-sb-trust.install` | Records the sha256 of the UKI `kernel-install add` just built (in `/var/lib/maze-secureboot/trusted-ukis`), before it reaches the ESP. `maze-sb-sign` signs only UKIs listed there whose kernel is installed; anything else on the ESP is reported as REFUSED and left untouched. |
 | `/usr/lib/kernel/install.d/95-maze-sb-sign.install` | Signs inline during every `kernel-install add`, including manual ones. |
 | `/usr/lib/systemd/system/maze-sb-resign.{service,path}` | Self-heal for kernel writes with no pacman transaction. |
 | `/usr/lib/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf` | Repairs the chain after `bootctl update` overwrites `BOOTX64.EFI`. |
