@@ -26,13 +26,15 @@ this package, so every existing Maze install picks it up on the next
 
 | Path | Role |
 |---|---|
-| `/usr/bin/maze-sb-sign` | Signs the UKI with the machine MOK, installs it as `EFI/BOOT/grubx64.efi` (shim's second stage), reinstalls shim, keeps a rollback copy, prunes stale UKIs. `flock`-serialised. |
+| `/usr/bin/maze-sb-sign` | Signs the UKI with the machine MOK, installs it as `EFI/BOOT/grubx64.efi` (shim's second stage), reinstalls shim, keeps a rollback copy, prunes stale UKIs. Also keeps the firmware entries: "Maze Linux (recovery kernel)" via shim, plus **"Maze Linux (no shim, Secure Boot off)"** and "Maze Linux (recovery kernel, no shim)", which start the UKIs directly — the way in if shim itself ever breaks (disable Secure Boot, pick it from the firmware boot menu). All appended at the end of BootOrder. `flock`-serialised. |
 | `/usr/bin/maze-kernel-install-add` | Runs `kernel-install add` for each upgraded kernel — the step stock Arch never performs. |
 | `/usr/share/libalpm/hooks/85-maze-kernel-install.hook` | Fires on `usr/lib/modules/*/vmlinuz`; rebuilds the UKI **before** the re-sign pass. |
 | `/usr/share/libalpm/hooks/zz-maze-secureboot.hook` | Idempotent re-sign after kernel/nvidia/dkms/mkinitcpio/systemd changes. |
 | `/usr/bin/maze-sb-rotate-key` | Opt-in, never run automatically. Replaces the machine MOK key so every image ever signed with the old one stops booting (MOK has no revocation list). Staged `start` → `continue` → `continue` → `continue`, one MokManager confirmation and reboot per stage; boot images are only ever signed with an already-enrolled key, and the old key is deleted only after the new images have booted. `cancel` backs out of any stage. |
 | `/usr/lib/kernel/install.d/85-maze-sb-trust.install` | Records the sha256 of the UKI `kernel-install add` just built (in `/var/lib/maze-secureboot/trusted-ukis`), before it reaches the ESP. `maze-sb-sign` signs only UKIs listed there whose kernel is installed; anything else on the ESP is reported as REFUSED and left untouched. |
 | `/usr/lib/kernel/install.d/95-maze-sb-sign.install` | Signs inline during every `kernel-install add`, including manual ones. |
+| `/usr/lib/maze-secureboot/kernel-install-add` | Wrapper both rebuild paths use. If `kernel-install add` fails but the new UKI provably reached the ESP (sha256 matches this run's build record), the failure came from a non-Maze plugin running after the boot image was in place — reported as a warning, not as "do NOT reboot". |
+| `/etc/kernel/install.d/99-uki-uefi-setup.install` → `/dev/null` | Masks virt-firmware's plugin, which registers UKIs as direct firmware entries (wrong on a shim chain) and, since 26.10, fails every `kernel-install add` with "shim binary needed but not found". |
 | `/usr/lib/systemd/system/maze-sb-resign.{service,path}` | Self-heal for kernel writes with no pacman transaction. |
 | `/usr/lib/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf` | Repairs the chain after `bootctl update` overwrites `BOOTX64.EFI`. |
 
@@ -40,7 +42,7 @@ this package, so every existing Maze install picks it up on the next
 
 | Path | Role |
 |---|---|
-| `/usr/bin/maze-boot-check` | End-to-end verification of the whole chain — 11 checks, each with the command that fixes it. `--repair` rebuilds and re-signs. |
+| `/usr/bin/maze-boot-check` | End-to-end verification of the whole chain — 13 checks, each with the command that fixes it. `--repair` rebuilds and re-signs. |
 | `/usr/share/libalpm/hooks/zzz-maze-boot-verify.hook` | Last hook of every relevant transaction; runs the check and raises the flag. |
 | `/usr/bin/maze-boot-guard` + `.service` / `.path` | Holds a logind shutdown inhibitor while `/var/lib/maze/boot-unsafe` exists. |
 | `/usr/bin/maze-boot-notify` + `etc/xdg/autostart` | Critical desktop notification at login. |

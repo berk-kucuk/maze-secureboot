@@ -40,7 +40,10 @@ fi
 rc=0
 for kver in $kvers; do
     [ -f "/usr/lib/modules/$kver/vmlinuz" ] || continue
-    if ! kernel-install add "$kver" "/usr/lib/modules/$kver/vmlinuz"; then
+    # The wrapper verifies the new UKI actually reached the ESP, so a failing
+    # non-Maze kernel-install plugin that runs after it is a warning, not this.
+    if ! MAZE_KI_SELF=maze-kernel-install-add /usr/lib/maze-secureboot/kernel-install-add \
+            "$kver" "/usr/lib/modules/$kver/vmlinuz"; then
         rc=1
         echo "maze-kernel-install-add: ERROR - kernel-install add FAILED for $kver" >&2
         echo "maze-kernel-install-add:   The UKI on the ESP was NOT rebuilt. If this was a kernel" >&2

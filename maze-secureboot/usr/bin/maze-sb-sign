@@ -838,12 +838,15 @@ install_recovery() {
 # original order is captured, and afterwards restored with the new entry
 # appended at the end — present in the firmware's boot menu, never ahead of the
 # real one.
-ensure_recovery_nvram() {
-    [ -s "$RECOVERY_IMG" ] || return 0
+#   ensure_nvram_entry LABEL LOADER FILE
+# LABEL is matched literally, so no label may be a substring of another one.
+ensure_nvram_entry() {
+    _ne_label="$1"; _ne_loader="$2"; _ne_file="$3"
+    [ -s "$_ne_file" ] || return 0
     command -v efibootmgr >/dev/null 2>&1 || return 0
     [ -d /sys/firmware/efi/efivars ] || return 0
 
-    if efibootmgr 2>/dev/null | grep -Fq "$RECOVERY_LABEL"; then
+    if efibootmgr 2>/dev/null | grep -Fq "$_ne_label"; then
         return 0
     fi
 
@@ -853,7 +856,7 @@ ensure_recovery_nvram() {
     _partn="$(lsblk -no PARTN "$_src" 2>/dev/null | tr -d '[:space:]' || true)"
     _disk="$(lsblk -no PKNAME "$_src" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
     if [ -z "$_partn" ] || [ -z "$_disk" ]; then
-        echo "maze-sb-sign: WARNING - could not identify the ESP disk; no recovery boot entry" >&2
+        echo "maze-sb-sign: WARNING - could not identify the ESP disk; no \"$_ne_label\" boot entry" >&2
         return 0
     fi
 
@@ -861,9 +864,9 @@ ensure_recovery_nvram() {
 
     if ! efibootmgr --quiet --create \
             --disk "/dev/$_disk" --part "$_partn" \
-            --loader '\EFI\maze-recovery\BOOTX64.EFI' \
-            --label "$RECOVERY_LABEL" >/dev/null 2>&1; then
-        echo "maze-sb-sign: WARNING - could not create the recovery boot entry" >&2
+            --loader "$_ne_loader" \
+            --label "$_ne_label" >/dev/null 2>&1; then
+        echo "maze-sb-sign: WARNING - could not create the \"$_ne_label\" boot entry" >&2
         return 0
     fi
 
@@ -884,15 +887,40 @@ ensure_recovery_nvram() {
         _new="$_before${_added:+,$_added}"
         if [ "$_new" != "$_after" ]; then
             efibootmgr --quiet --bootorder "$_new" >/dev/null 2>&1 \
-                || echo "maze-sb-sign: WARNING - recovery entry created but BootOrder not restored" >&2
+                || echo "maze-sb-sign: WARNING - \"$_ne_label\" entry created but BootOrder not restored" >&2
         fi
     fi
-    echo "maze-sb-sign: created firmware boot entry \"$RECOVERY_LABEL\""
+    echo "maze-sb-sign: created firmware boot entry \"$_ne_label\""
     return 0
 }
 
+# --- Last resort: boot WITHOUT shim, with Secure Boot disabled ---------------
+#
+# Every entry above goes through shim. Shim is a third-party binary that can
+# stop working on its own: an SBAT/dbx revocation pushed by a firmware or
+# fwupd update, a corrupt copy on the ESP, a firmware that rejects it. When it
+# does, the kernels and the signed UKIs are all still fine — there is simply
+# nothing left that loads them, and "turn Secure Boot off" does not help,
+# because every NVRAM entry still points at the broken shim.
+#
+# A UKI is itself a complete EFI application (systemd-stub + kernel + initrd +
+# cmdline), so the firmware can start it directly. These entries do exactly
+# that, pointing at the SAME files shim chainloads — no extra copy on the ESP,
+# and they follow every kernel update automatically because grubx64.efi is
+# always replaced in place under the same name.
+#
+# With Secure Boot ON the firmware refuses them (the MOK key is not in db) and
+# moves on to the next entry; they sit at the END of BootOrder, so they are
+# never tried before the real chain. With Secure Boot OFF they always boot.
+# Recovery procedure if shim ever breaks: firmware setup -> Secure Boot ->
+# Disabled -> boot menu (F11/F12/Esc) -> "Maze Linux (no shim, Secure Boot off)".
+DIRECT_LABEL="Maze Linux (no shim, Secure Boot off)"
+DIRECT_RECOVERY_LABEL="Maze Linux (recovery kernel, no shim)"
+
 install_recovery
-ensure_recovery_nvram
+ensure_nvram_entry "$RECOVERY_LABEL" '\EFI\maze-recovery\BOOTX64.EFI' "$RECOVERY_IMG"
+ensure_nvram_entry "$DIRECT_LABEL" '\EFI\BOOT\grubx64.efi' "$GRUB"
+ensure_nvram_entry "$DIRECT_RECOVERY_LABEL" '\EFI\maze-recovery\grubx64.efi' "$RECOVERY_IMG"
 
 if [ "$status_ok" = 1 ]; then
     # Point at the rollback copy while the user can still read it. It is the only

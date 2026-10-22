@@ -38,8 +38,8 @@
 # /usr/local/bin paths so nothing that still references them can break.
 
 pkgname=maze-secureboot
-pkgver=2.0.1
-pkgrel=1
+pkgver=2.0.2
+pkgrel=2
 pkgdesc="Maze Linux Secure Boot chain — UKI rebuild, MOK signing, and a boot-chain check that blocks unsafe reboots"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"
@@ -81,6 +81,20 @@ package() {
   cp -a "${startdir}/maze-secureboot/usr" "${pkgdir}/usr"
   cp -a "${startdir}/maze-secureboot/etc" "${pkgdir}/etc"
 
+  # Mask kernel-install plugins from other packages that fight the shim chain.
+  # A same-named /dev/null symlink in /etc/kernel/install.d is kernel-install's
+  # own disable mechanism (kernel-install(8)), and owning it here means it
+  # arrives with the next -Syu and leaves with this package.
+  #
+  # 99-uki-uefi-setup.install (virt-firmware): registers every UKI as its own
+  # firmware boot entry and sets BootNext to it. On Maze the firmware must load
+  # shim, not the MOK-signed UKI — with Secure Boot on such an entry cannot
+  # boot. Since virt-firmware 26.10 it also aborts `kernel-install add` with
+  # "shim binary needed but not found" after the UKI is already installed,
+  # which made every kernel rebuild report failure (2026-10-22).
+  install -dm755 "${pkgdir}/etc/kernel/install.d"
+  ln -s /dev/null "${pkgdir}/etc/kernel/install.d/99-uki-uefi-setup.install"
+
   # The flag file lives here. Ship the directory so nothing has to guess whether
   # it exists before writing to it.
   install -dm755 "${pkgdir}/var/lib/maze"
@@ -96,6 +110,7 @@ package() {
             "${pkgdir}"/usr/bin/maze-boot-notify \
             "${pkgdir}"/usr/bin/maze-boot-entries \
             "${pkgdir}"/usr/lib/maze-secureboot/mkinitcpio-hooks \
+            "${pkgdir}"/usr/lib/maze-secureboot/kernel-install-add \
             "${pkgdir}"/usr/lib/kernel/install.d/85-maze-sb-trust.install \
             "${pkgdir}"/usr/lib/kernel/install.d/95-maze-sb-sign.install
   chmod 644 "${pkgdir}"/usr/share/libalpm/hooks/* \

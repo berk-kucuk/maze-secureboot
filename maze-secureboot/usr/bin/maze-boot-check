@@ -536,6 +536,21 @@ else
     fi
 fi
 
+# --- 13) is there a way in if shim itself breaks? ----------------------------
+# Every entry above starts shim. If shim stops working (SBAT/dbx revocation,
+# corrupt copy) the UKIs are fine but nothing loads them — unless the firmware
+# has an entry that starts the UKI directly, usable with Secure Boot disabled.
+# maze-sb-sign writes it; like 12) this is about recoverability, never a failure.
+_direct_label="Maze Linux (no shim, Secure Boot off)"
+if ! command -v efibootmgr >/dev/null 2>&1 || [ ! -d /sys/firmware/efi/efivars ]; then
+    skip "Could not read the firmware boot entries - no-shim fallback not verified"
+elif efibootmgr 2>/dev/null | grep -Fq "$_direct_label"; then
+    ok "No-shim fallback entry present - boots with Secure Boot disabled if shim ever fails"
+else
+    skip "No no-shim fallback entry - if shim breaks, disabling Secure Boot will not help"
+    say "          Add it with:  sudo maze-sb-sign"
+fi
+
 # --- verdict ----------------------------------------------------------------
 
 say ""

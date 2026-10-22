@@ -1,0 +1,89 @@
+#!/bin/sh
+# Managed by Maze Linux. `kernel-install add KVER VMLINUZ`, with a verdict that
+# tells a broken boot image apart from a broken BYSTANDER.
+#
+#   kernel-install-add KVER VMLINUZ
+#     exit 0  the new UKI is on the ESP (kernel-install succeeded, or only a
+#             plugin that runs after the UKI was installed failed — warned)
+#     exit 1  the new UKI did NOT reach the ESP — a real failure
+#
+# WHY
+# ---
+# `kernel-install add` runs every plugin in /etc/kernel/install.d and
+# /usr/lib/kernel/install.d and fails as a whole if ANY of them fails. Most of
+# those plugins are not Maze's: they arrive with whatever package the admin
+# installs. On 2026-10-22 virt-firmware 26.10 (installed for VM testing) shipped
+# 99-uki-uefi-setup.install, which wants to register every UKI as a firmware
+# boot entry and dies with "shim binary needed but not found" on a shim system.
+# It runs LAST — after 90-uki-copy.install had installed the new UKI and
+# 95-maze-sb-sign.install had signed it — so the boot chain was complete and
+# correct, yet every kernel was reported "kernel-install add FAILED" and the
+# rebuild ended with "do NOT reboot". The failure was real; it just was not a
+# failure of the boot image, and treating the two the same leaves the user
+# chasing (and "fixing", by chmod -x on package files) the wrong thing.
+#
+# HOW "THE UKI LANDED" IS DECIDED — from evidence, never from the exit code
+# -------------------------------------------------------------------------
+# 85-maze-sb-trust.install records the sha256 of the UKI ukify just built in
+# the trust list, inside this same kernel-install run, before the copy. So the
+# new image reached the ESP exactly when:
+#   * the trust list was written during this run (newer than our stamp), and
+#   * a <token>-KVER.efi on the ESP has the sha256 of the NEWEST entry for KVER.
+# A UKI left over from an earlier build fails the first test or the second; a
+# half-copied one fails the second. Anything short of both is a real failure.
+set -u
+
+KVER="${1:-}"
+VMLINUZ="${2:-}"
+SELF="${MAZE_KI_SELF:-maze-kernel-install}"
+TRUST_DB=/var/lib/maze-secureboot/trusted-ukis
+
+if [ -z "$KVER" ] || [ -z "$VMLINUZ" ]; then
+    echo "usage: ${0##*/} KVER VMLINUZ" >&2
+    exit 2
+fi
+
+stamp="$(mktemp /run/maze-ki-stamp.XXXXXX 2>/dev/null || mktemp)" || stamp=""
+# The stamp must be strictly older than anything this run writes; on a fast
+# machine the trust list can be rewritten within the same timestamp tick.
+[ -n "$stamp" ] && touch -d '-2 seconds' "$stamp" 2>/dev/null || true
+
+kernel-install add "$KVER" "$VMLINUZ"
+rc=$?
+
+uki_landed() {
+    [ -n "$stamp" ] && [ -f "$TRUST_DB" ] && [ "$TRUST_DB" -nt "$stamp" ] || return 1
+    # Newest recorded build for this kernel (the list is appended to).
+    want="$(awk -v k="$KVER" '$2 == k { s = $1 } END { print s }' "$TRUST_DB" 2>/dev/null)"
+    [ -n "$want" ] || return 1
+    for esp in "$(bootctl --print-esp-path 2>/dev/null || true)" \
+               "$(bootctl --print-boot-path 2>/dev/null || true)" /efi /boot /boot/efi; do
+        [ -n "$esp" ] && [ -d "$esp/EFI/Linux" ] || continue
+        for f in "$esp/EFI/Linux/"*"-$KVER.efi"; do
+            [ -f "$f" ] || continue
+            [ "$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)" = "$want" ] && return 0
+        done
+    done
+    return 1
+}
+
+if [ "$rc" -ne 0 ] && uki_landed; then
+    echo "$SELF: WARNING - kernel-install reported a failure for $KVER, but the new UKI" >&2
+    echo "$SELF:   WAS built and installed on the ESP (verified against the build record)." >&2
+    echo "$SELF:   The failing step is a kernel-install plugin that runs after the boot" >&2
+    echo "$SELF:   image is in place — usually one shipped by a non-Maze package. The boot" >&2
+    echo "$SELF:   chain itself is not affected. Non-Maze plugins on this system:" >&2
+    for p in /etc/kernel/install.d/*.install /usr/lib/kernel/install.d/*.install; do
+        [ -e "$p" ] || continue
+        case "${p##*/}" in *maze*) continue ;; esac
+        [ -L "$p" ] && [ "$(readlink "$p")" = /dev/null ] && continue
+        owner="$(pacman -Qqo "$p" 2>/dev/null || echo unowned)"
+        # The stock pipeline Maze is built on — not suspects.
+        case "$owner" in systemd|systemd-ukify|mkinitcpio) continue ;; esac
+        echo "$SELF:     $p ($owner)" >&2
+    done
+    rc=0
+fi
+
+[ -n "$stamp" ] && rm -f "$stamp"
+exit "$rc"

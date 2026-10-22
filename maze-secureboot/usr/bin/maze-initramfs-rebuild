@@ -57,7 +57,9 @@ for d in /usr/lib/modules/*/; do
     fi
     found=$((found + 1))
     echo "$SELF: rebuilding initramfs + UKI for ${kver}"
-    if ! kernel-install add "$kver" "${d}vmlinuz"; then
+    # Through the Maze wrapper: a non-Maze kernel-install plugin failing AFTER
+    # the UKI is installed is reported as a warning, not as a broken boot.
+    if ! MAZE_KI_SELF="$SELF" /usr/lib/maze-secureboot/kernel-install-add "$kver" "${d}vmlinuz"; then
         rc=1
         echo "$SELF: ERROR - kernel-install add FAILED for ${kver}" >&2
     fi

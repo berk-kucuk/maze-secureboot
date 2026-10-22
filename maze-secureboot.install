@@ -251,6 +251,9 @@ post_upgrade() {
     echo ">>   builds a recovery boot entry for it under EFI/maze-recovery and adds"
     echo ">>   it to the firmware boot menu. Pick 'Maze Linux (recovery kernel)'"
     echo ">>   from the boot menu (F12 on most machines) when the normal one fails."
+    echo ">> maze-secureboot: if shim itself ever stops working, disable Secure Boot in"
+    echo ">>   the firmware and pick 'Maze Linux (no shim, Secure Boot off)' instead —"
+    echo ">>   it starts the kernel image directly, without shim."
     echo ">>   Verify it with: sudo maze-boot-check"
 }
 
