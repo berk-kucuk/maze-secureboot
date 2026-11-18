@@ -35,7 +35,7 @@ this package, so every existing Maze install picks it up on the next
 | `/usr/lib/kernel/install.d/95-maze-sb-sign.install` | Signs inline during every `kernel-install add`, including manual ones. |
 | `/usr/lib/maze-secureboot/kernel-install-add` | Wrapper both rebuild paths use. If `kernel-install add` fails but the new UKI provably reached the ESP (sha256 matches this run's build record), the failure came from a non-Maze plugin running after the boot image was in place — reported as a warning, not as "do NOT reboot". |
 | `/etc/kernel/install.d/99-uki-uefi-setup.install` → `/dev/null` | Masks virt-firmware's plugin, which registers UKIs as direct firmware entries (wrong on a shim chain) and, since 26.10, fails every `kernel-install add` with "shim binary needed but not found". |
-| `/usr/lib/systemd/system/maze-sb-resign.{service,path}` | Self-heal for kernel writes with no pacman transaction. |
+| `/usr/lib/systemd/system/maze-sb-resign.{service,path}` | Self-heal for kernel writes with no pacman transaction. When it fires during a pacman transaction (UKIs still being built), it waits for pacman to finish and signs the final state instead of failing on a half-built set. |
 | `/usr/lib/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf` | Repairs the chain after `bootctl update` overwrites `BOOTX64.EFI`. |
 
 **Refusing to let you reboot into a broken chain**
@@ -78,6 +78,21 @@ lock anyone out of their computer.
 * `/var/lib/maze-secureboot/{shim,mm}x64.efi` — shim binaries copied off the ISO
 * `/etc/kernel/cmdline` and `/etc/kernel/install.conf` (`layout=uki`)
 * the `Maze Linux` NVRAM boot entry, and `ENROLLMENT.txt`
+
+### The signing key and disk encryption
+
+`MOK.key` is not encrypted itself: it has to be usable at every kernel update
+without anyone typing a passphrase. Root can always read it (root can also
+replace the kernel); `maze-boot-check` keeps it root-only and puts loose
+permissions right. What protects it from everyone else is the disk: on an
+encrypted install, someone with the disk in hand cannot read it. On an
+**unencrypted** disk they can copy it and sign a boot image this machine will
+trust — Secure Boot then still stops changed images from software on the
+running system, but not that. The installer says so (in the log and in
+`ENROLLMENT.txt`), and `maze-boot-check` reports it as a `[NOTE]` (not a
+failure: nothing about the next boot is broken). With encryption, binding the
+unlock to the TPM (`systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`) also
+makes a changed boot chain fail to unlock the disk.
 
 ## Migration off the old layout
 

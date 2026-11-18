@@ -93,6 +93,78 @@ if [ ! -r "$KEY" ] || [ ! -r "$CRT" ]; then
     echo "maze-sb-sign: no MOK key, skipping" >&2; exit 0
 fi
 
+# --- Wait for a running pacman transaction (maze-sb-resign.service only) ----
+# maze-sb-resign.path fires the moment ANY file in $ESP/EFI/Linux changes. In a
+# pacman transaction that rebuilds more than one kernel, 85-maze-kernel-install
+# writes the UKIs one after another, so the path unit starts this script after
+# the first one lands — while the newest kernel's UKI is still being built. That
+# run correctly refuses to touch grubx64.efi ("no trusted UKI for <kver>"), but
+# it exits 1 and leaves a failed unit and a "Failed to start" line in the
+# journal on every kernel update; 9 seconds later the next run, and the
+# zz-maze-secureboot hook, sign everything. A false alarm on the one unit whose
+# failures must be taken seriously.
+#
+# So when the SERVICE starts this while pacman holds its database lock, it waits
+# for the transaction to finish and then signs the final state. The service
+# asks for this with MAZE_SB_SIGN_DEFER=1; every other caller runs at once as
+# before — and must: 95-maze-sb-sign.install, zz-maze-secureboot.hook and the
+# package scriptlet run INSIDE the transaction, so waiting for pacman there
+# would wait forever.
+#
+# Rules, each one so this can never make things worse than not waiting:
+#   * Wait BEFORE taking the signer lock below. Holding it while waiting would
+#     block the in-transaction signer (the hook) behind us — a deadlock.
+#   * Only while a process really holds the lock open. libalpm keeps db.lck
+#     open for the whole transaction; a lock left behind by a crashed pacman
+#     has no holder, and pacman itself refuses to run until it is removed, so
+#     signing now is right.
+#   * Never during boot or shutdown: the service is also WantedBy
+#     multi-user.target, and a oneshot that waits would hold up the boot.
+#   * At most MAZE_SB_SIGN_DEFER_MAX seconds (default 4 h, a slow full
+#     upgrade); after that, sign as before. A run that starts early can only
+#     fail loudly and leave grubx64.efi alone, as it always did.
+pacman_lockfile() {
+    _pl_db="$(pacman-conf DBPath 2>/dev/null | head -n 1 || true)"
+    case "$_pl_db" in
+        /*) ;;
+        *) _pl_db=/var/lib/pacman/ ;;
+    esac
+    printf '%s/db.lck\n' "${_pl_db%/}"
+}
+
+# True while some process has the lock file open (pacman, or any libalpm
+# front-end). /proc is read directly; no psmisc dependency.
+pacman_lock_held() {
+    [ -e "$1" ] || return 1
+    find /proc/[0-9]*/fd -maxdepth 1 -lname "$1" 2>/dev/null | grep -q .
+}
+
+wait_for_pacman() {
+    _wp_lock="$(pacman_lockfile)"
+    pacman_lock_held "$_wp_lock" || return 0
+    case "$(systemctl is-system-running 2>/dev/null || true)" in
+        initializing|starting|stopping) return 0 ;;
+    esac
+    _wp_max="${MAZE_SB_SIGN_DEFER_MAX:-14400}"
+    case "$_wp_max" in ''|*[!0-9]*) _wp_max=14400 ;; esac
+    echo "maze-sb-sign: a pacman transaction is running; signing once it has finished"
+    _wp_waited=0
+    while pacman_lock_held "$_wp_lock"; do
+        if [ "$_wp_waited" -ge "$_wp_max" ]; then
+            echo "maze-sb-sign: pacman still holds its lock after ${_wp_max}s; signing now" >&2
+            return 0
+        fi
+        sleep 2
+        _wp_waited=$((_wp_waited + 2))
+    done
+    echo "maze-sb-sign: pacman finished after ~${_wp_waited}s"
+    return 0
+}
+
+if [ "${MAZE_SB_SIGN_DEFER:-0}" = 1 ]; then
+    wait_for_pacman
+fi
+
 # Serialize all invocations. This script is triggered from up to three
 # independent, overlapping sources for a single kernel update — the
 # 85-maze-kernel-install.hook -> kernel-install add -> 95-maze-sb-sign.install

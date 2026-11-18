@@ -4,6 +4,10 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
+# Started by maze-sb-resign.path while pacman may still be building UKIs: wait
+# for the transaction to finish, then sign its final state (see maze-sb-sign).
+# Never waits during boot, and in-transaction callers do not set this.
+Environment=MAZE_SB_SIGN_DEFER=1
 ExecStart=/usr/bin/maze-sb-sign
 
 [Install]

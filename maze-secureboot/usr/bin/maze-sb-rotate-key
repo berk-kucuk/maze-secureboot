@@ -228,7 +228,7 @@ cmd_start() {
     ( umask 077; mkdir -p "$ROT" )
     rm -f "$ROT"/new.*
     ( umask 077
-      openssl req -newkey rsa:2048 -nodes -keyout "$ROT/new.key" -new -x509 -sha256 -days 3650 \
+      openssl req -newkey rsa:3072 -nodes -keyout "$ROT/new.key" -new -x509 -sha256 -days 3650 \
           -subj "/CN=Maze Linux Secure Boot machine key $(date +%Y-%m-%d)/" \
           -out "$ROT/new.crt" >/dev/null 2>&1 \
       && openssl x509 -outform DER -in "$ROT/new.crt" -out "$ROT/new.cer" >/dev/null 2>&1 ) \

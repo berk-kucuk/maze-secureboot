@@ -39,7 +39,7 @@
 
 pkgname=maze-secureboot
 pkgver=2.0.2
-pkgrel=2
+pkgrel=4
 pkgdesc="Maze Linux Secure Boot chain — UKI rebuild, MOK signing, and a boot-chain check that blocks unsafe reboots"
 arch=('any')
 url="https://mazelinux.berkkucukk.com.tr"

@@ -65,6 +65,12 @@ say()  { report="${report}$1
 "; }
 ok()   { say "  [ OK ]  $1"; }
 skip() { say "  [ -- ]  $1"; }
+# Worth knowing, but nothing is broken: not a failure, never sets the flag.
+note() {
+    say "  [NOTE]  $1"
+    shift
+    for _l in "$@"; do say "          $_l"; done
+}
 bad() {
     say "  [FAIL]  $1"
     [ -n "${2:-}" ] && say "          $2"
@@ -312,6 +318,45 @@ else
     bad "Secure Boot is on but the MOK is not enrolled" \
         "The firmware will not trust the signed image; boot lands in MokManager." \
         "sudo mokutil --import $KEYDIR/MOK.cer   (then reboot and pick 'Enroll key from disk')"
+fi
+
+# --- 6b) the signing key itself ---------------------------------------------
+# Whoever holds MOK.key can sign a boot image this machine will trust. Root
+# can always read it — that is by design, root can also replace the kernel.
+# Two ways it can be exposed to anyone else:
+#   * permissions: readable by a non-root account;
+#   * storage: on a disk that is not encrypted, anyone who can take the disk
+#     out (or boot something else) copies it and signs what they like, and
+#     Secure Boot no longer tells their image from yours.
+
+_key_mode="$(stat -c '%a %U' "$KEYDIR/MOK.key" 2>/dev/null || true)"
+_dir_mode="$(stat -c '%a %U' "$KEYDIR" 2>/dev/null || true)"
+if [ "$_key_mode" = "600 root" ] && [ "$_dir_mode" = "700 root" ]; then
+    ok "The signing key is readable by root only"
+# Not a [FAIL]: that means "the next reboot may not start" and holds off
+# shutdown, and loose permissions do not break booting. This runs as root, so
+# it is simply put right.
+elif chown root:root "$KEYDIR" "$KEYDIR/MOK.key" 2>/dev/null \
+        && chmod 700 "$KEYDIR" 2>/dev/null && chmod 600 "$KEYDIR/MOK.key" 2>/dev/null; then
+    ok "The signing key was readable by more than root (key: $_key_mode, dir: $_dir_mode) — fixed"
+else
+    note "The signing key is readable by more than root (key: $_key_mode, dir: $_dir_mode)" \
+         "Anyone who can read MOK.key can sign boot images this machine trusts:" \
+         "sudo chown root:root $KEYDIR $KEYDIR/MOK.key && sudo chmod 700 $KEYDIR && sudo chmod 600 $KEYDIR/MOK.key"
+fi
+
+_key_src="$(findmnt -no SOURCE -T "$KEYDIR" 2>/dev/null | sed 's/\[.*\]$//' || true)"
+if [ -n "$_key_src" ] && lsblk -nso TYPE "$_key_src" 2>/dev/null | grep -qx crypt; then
+    ok "The signing key is on an encrypted disk"
+elif [ -n "$_key_src" ]; then
+    note "The signing key is stored on a disk that is NOT encrypted ($_key_src)" \
+         "Secure Boot here stops changed boot images from software on this machine," \
+         "but not someone with the disk in hand: they can copy $KEYDIR/MOK.key" \
+         "and sign their own. Full-disk encryption (re-install with it) closes that;" \
+         "with it, binding the unlock to the TPM also makes a changed boot chain" \
+         "fail to unlock:  sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 <LUKS device>"
+else
+    skip "Could not tell which disk holds $KEYDIR"
 fi
 
 # --- 7) LUKS: can the initramfs actually unlock the root? -------------------
