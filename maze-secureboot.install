@@ -255,6 +255,16 @@ post_upgrade() {
     echo ">>   the firmware and pick 'Maze Linux (no shim, Secure Boot off)' instead —"
     echo ">>   it starts the kernel image directly, without shim."
     echo ">>   Verify it with: sudo maze-boot-check"
+    # 2.1.0: the password-less emergency shell is decided per boot now.
+    if [ -x /usr/lib/systemd/system-generators/maze-sulogin-generator ]; then
+        case "$(/usr/lib/systemd/system-generators/maze-sulogin-generator --status 2>/dev/null)" in
+            off\ *)
+                echo ">> maze-secureboot: the emergency shell no longer opens without a root password"
+                echo ">>   on this machine ($(/usr/lib/systemd/system-generators/maze-sulogin-generator --status | cut -d' ' -f2-))."
+                echo ">>   It stays open only where reaching it proves the disk passphrase was typed."
+                echo ">>   To allow it anyway: sudo mkdir -p /etc/maze && sudo touch /etc/maze/sulogin-force" ;;
+        esac
+    fi
 }
 
 pre_remove() {

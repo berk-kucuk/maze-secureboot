@@ -211,6 +211,8 @@ cmd_status() {
         delete-pending) say "stage 3 of 3: waiting for the OLD key to be deleted."
                         say "  Reboot, pick 'Delete MOK' in MokManager, enter the password, then run:"
                         say "  sudo $SELF continue" ;;
+        cancelling)     say "a cancel was interrupted while switching back to the old key."
+                        say "  Run: sudo maze-sb-sign --force-bootloader, check its output, then remove $STATE" ;;
         *)              say "unknown state '$_s' in $STATE" ;;
     esac
 }

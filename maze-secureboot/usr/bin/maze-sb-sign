@@ -1,9 +1,11 @@
 #!/bin/sh
 # Managed by Maze Linux. Signs the kernel-install-built Unified Kernel Image
 # (layout=uki) that shim chainloads as grubx64.efi. Idempotent.
-# Usage: maze-sb-sign [ESP_MOUNTPOINT] [--force-bootloader]
+# Usage: maze-sb-sign [ESP_MOUNTPOINT] [--force-bootloader] [--retry-shim]
 #   --force-bootloader  re-sign grubx64.efi even when it is already current
 #                       (repair); without it an up-to-date image is left alone.
+#   --retry-shim        forget that a packaged shim failed its trial boot and
+#                       offer it again (see "Which shim goes on the ESP").
 set -eu
 
 KEYDIR=/var/lib/maze-secureboot
@@ -190,9 +192,11 @@ fi
 
 ESP=""
 force_bootloader=0
+retry_shim=0
 for arg in "$@"; do
     case "$arg" in
         --force-bootloader) force_bootloader=1 ;;
+        --retry-shim) retry_shim=1 ;;
         *) ESP="$arg" ;;
     esac
 done
@@ -358,9 +362,240 @@ sign_loose_kernel() {
 
 BOOTDIR="$ESP/EFI/BOOT"
 mkdir -p "$BOOTDIR"
-install_if_diff "$KEYDIR/shimx64.efi" "$BOOTDIR/BOOTX64.EFI"
-install_if_diff "$KEYDIR/mmx64.efi"   "$BOOTDIR/mmx64.efi"
-install_if_diff "$CER"                "$ESP/MOK.cer"
+
+# --- Which shim goes on the ESP -----------------------------------------------
+# The shim used to be copied off the install ISO into $KEYDIR ONCE and never
+# again: every run put that same copy back on the ESP, and maze-boot-check
+# compared against it. A shim-signed update therefore never reached an installed
+# machine — and the day a firmware or fwupd update revokes that shim generation
+# (SBAT), every Maze machine with Secure Boot on stops booting at once.
+#
+# The packaged shim (/usr/share/shim-signed, kept current by pacman) is now the
+# CANDIDATE, and $KEYDIR/shimx64.efi changes meaning: it is the LAST KNOWN GOOD
+# shim — one that has booted this machine with Secure Boot on. A new shim is
+# never trusted on its word, because a shim update is riskier than a kernel
+# update: the new shim writes its own revocations into firmware (SbatLevel) the
+# first time it runs, which can never be undone from the OS.
+#
+#   1. Checks before it is used at all: Microsoft-signed; its shim generation
+#      not revoked by this firmware (SbatLevelRT); not older than the last
+#      known good; and the revocations it would apply do not revoke the
+#      systemd-stub our UKIs are built on (that would brick both chains).
+#   2. Trial: it goes into EFI/BOOT only. EFI/maze-recovery keeps the last known
+#      good shim, so a shim that fails still leaves a firmware-menu way back.
+#   3. Promotion: after a reboot that came up WITH Secure Boot on THROUGH the
+#      primary chain (systemd-stub's StubImageIdentifier says which image it
+#      started), it becomes the last known good and the recovery chain follows.
+#   4. Rejection: if that reboot came up through the recovery chain instead,
+#      the new shim is assumed to have failed: it is recorded as rejected and
+#      the last known good goes back into EFI/BOOT. `--retry-shim` forgets that.
+#
+# Exception: when the last known good is itself revoked (by the firmware, or by
+# the candidate's own revocation policy) keeping it anywhere protects nothing —
+# it cannot boot with Secure Boot on — so the candidate goes everywhere at once.
+SHIM_PKG=/usr/share/shim-signed/shimx64.efi
+MM_PKG=/usr/share/shim-signed/mmx64.efi
+SHIM_LKG="$KEYDIR/shimx64.efi"
+MM_LKG="$KEYDIR/mmx64.efi"
+SHIM_PENDING="$KEYDIR/shim-pending"     # "<sha256> <boot_id>" of the shim on trial
+SHIM_REJECTED="$KEYDIR/shim-rejected"   # sha256 per line: shims that failed a trial
+SBAT_GUID=605dab50-e046-4300-abb6-3dd810dd8b23
+LOADER_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+
+# An EFI variable's payload as text: drop the 4 attribute bytes and the NULs of
+# UTF-16 (the variables read here are ASCII).
+efivar_text() {
+    [ -r "/sys/firmware/efi/efivars/$1" ] || return 1
+    tail -c +5 "/sys/firmware/efi/efivars/$1" 2>/dev/null | tr -d '\0'
+}
+
+# "component,generation" lines of a PE image's .sbat section.
+sbat_lines() {
+    objcopy -O binary --only-section=.sbat "$1" /dev/stdout 2>/dev/null \
+        | tr -d '\0' | awk -F, 'NF >= 2 && $2 ~ /^[0-9]+$/ { print $1 "," $2 }'
+}
+sbat_gen() { sbat_lines "$1" | awk -F, -v c="$2" '$1 == c { print $2; exit }'; }
+
+# Vendor version of a shim (e.g. 16.1-1): the highest version field among the
+# .sbat lines whose product is "shim".
+shim_version() {
+    objcopy -O binary --only-section=.sbat "$1" /dev/stdout 2>/dev/null \
+        | tr -d '\0' | awk -F, '$4 == "shim" { print $5 }' | sort -V | tail -1
+}
+
+# Revocations the RUNNING firmware enforces ("component,min-generation").
+fw_revocations() { efivar_text "SbatLevelRT-$SBAT_GUID" | awk -F, 'NF == 2 { print $1 "," $2 }'; }
+
+# Revocations a shim applies by itself on its first run: the "previous" policy
+# of its .sbatlevel section (u32 version, u32 offset of previous, u32 offset of
+# latest — offsets counted from byte 4; each policy a NUL-terminated string).
+shim_applies() {
+    _sa_tmp="$(mktemp /run/maze-sbatlevel.XXXXXX 2>/dev/null)" || return 0
+    if objcopy -O binary --only-section=.sbatlevel "$1" "$_sa_tmp" 2>/dev/null && [ -s "$_sa_tmp" ]; then
+        _sa_off="$(od -An -tu4 -j4 -N4 "$_sa_tmp" 2>/dev/null | tr -d '[:space:]')"
+        case "$_sa_off" in ''|*[!0-9]*) _sa_off="" ;; esac
+        if [ -n "$_sa_off" ]; then
+            tail -c +"$((_sa_off + 5))" "$_sa_tmp" | tr '\0' '\n' \
+                | awk -F, '/^$/ { exit } NF == 2 && $2 ~ /^[0-9]+$/ { print $1 "," $2 }'
+        fi
+    fi
+    rm -f "$_sa_tmp"
+}
+
+# Would REVOCATIONS (stdin, "component,min") revoke image FILE? Prints the
+# first offending "component gen<min", exits 0 when it would.
+revokes() { # file
+    _rv_have="$(sbat_lines "$1")"
+    while IFS=, read -r _rv_c _rv_min; do
+        [ "$_rv_c" = sbat ] && continue
+        _rv_g="$(printf '%s\n' "$_rv_have" | awk -F, -v c="$_rv_c" '$1 == c { print $2; exit }')"
+        [ -n "$_rv_g" ] || continue
+        if [ "$_rv_g" -lt "$_rv_min" ]; then
+            printf '%s %s<%s\n' "$_rv_c" "$_rv_g" "$_rv_min"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ms_signed() { (sbverify --list "$1") 2>/dev/null | grep -q 'O=Microsoft Corporation'; }
+boot_id() { tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true; }
+sb_on() {
+    # SecureBoot-8be4df61-...: 4 attribute bytes, then 1 byte (1 = enabled).
+    [ "$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null \
+          | tr -d '[:space:]')" = 1 ]
+}
+# Which image systemd-stub was started as on this boot, lower-cased, e.g.
+# \efi\boot\grubx64.efi. Empty when the stub did not say.
+# shellcheck disable=SC1003  # '\\' is tr's literal backslash, not an escaped quote
+booted_image() { efivar_text "StubImageIdentifier-$LOADER_GUID" | tr 'A-Z/' 'a-z\\'; }
+
+# Copy into place by rename, so a half-written shim never sits on the ESP.
+install_atomic() { # src dst
+    [ -f "$1" ] || return 0
+    cmp -s "$1" "$2" 2>/dev/null && return 0
+    if cp -f "$1" "$2.maze-new" && mv -f "$2.maze-new" "$2"; then return 0; fi
+    rm -f "$2.maze-new"
+    return 1
+}
+
+# Make the candidate the last known good (and the source of the recovery chain).
+promote_shim() {
+    ( umask 077
+      cp -f "$SHIM_PKG" "$SHIM_LKG.tmp" && mv -f "$SHIM_LKG.tmp" "$SHIM_LKG" ) || return 1
+    if [ -f "$MM_PKG" ]; then
+        ( umask 077; cp -f "$MM_PKG" "$MM_LKG.tmp" && mv -f "$MM_LKG.tmp" "$MM_LKG" ) || true
+    fi
+    rm -f "$SHIM_PENDING"
+}
+
+[ "$retry_shim" = 0 ] || { rm -f "$SHIM_REJECTED"; echo "maze-sb-sign: forgot rejected shims; the packaged shim is offered again"; }
+
+# The shim that goes into EFI/BOOT; the recovery chain always uses $SHIM_LKG.
+SHIM_PRIMARY="$SHIM_LKG"
+MM_PRIMARY="$MM_LKG"
+
+shim_candidate_ok() {
+    [ -s "$SHIM_PKG" ] || return 1
+    [ -s "$SHIM_LKG" ] || return 0      # nothing better to compare with
+    _cs="$(file_sha256 "$SHIM_PKG")"
+    [ "$_cs" != "$(file_sha256 "$SHIM_LKG")" ] || return 1
+    if grep -qx "$_cs" "$SHIM_REJECTED" 2>/dev/null; then
+        echo "maze-sb-sign: packaged shim $(shim_version "$SHIM_PKG") failed its trial boot here earlier; keeping the last known good (retry: sudo maze-sb-sign --retry-shim)" >&2
+        return 1
+    fi
+    if ! ms_signed "$SHIM_PKG"; then
+        echo "maze-sb-sign: WARNING - $SHIM_PKG carries no Microsoft signature; not using it" >&2
+        return 1
+    fi
+    _cg="$(sbat_gen "$SHIM_PKG" shim)"; _lg="$(sbat_gen "$SHIM_LKG" shim)"
+    case "$_cg" in ''|*[!0-9]*)
+        echo "maze-sb-sign: WARNING - cannot read the SBAT generation of $SHIM_PKG; not using it" >&2
+        return 1 ;;
+    esac
+    _r="$(fw_revocations | revokes "$SHIM_PKG" || true)"
+    if [ -n "$_r" ]; then
+        echo "maze-sb-sign: WARNING - packaged shim is revoked by this firmware ($_r); not using it" >&2
+        return 1
+    fi
+    case "$_lg" in ''|*[!0-9]*) _lg=0 ;; esac
+    _cv="$(shim_version "$SHIM_PKG")"; _lv="$(shim_version "$SHIM_LKG")"
+    if [ "$_cg" -lt "$_lg" ] || { [ -n "$_lv" ] && [ -n "$_cv" ] \
+            && [ "$(printf '%s\n%s\n' "$_cv" "$_lv" | sort -V | head -1)" != "$_lv" ]; }; then
+        return 1                         # older than what already boots: never downgrade
+    fi
+    # The revocations it would write must not revoke our own boot image.
+    for _img in "$BOOTDIR/grubx64.efi" /usr/lib/systemd/boot/efi/linuxx64.efi.stub; do
+        [ -f "$_img" ] || continue
+        _r="$(shim_applies "$SHIM_PKG" | revokes "$_img" || true)"
+        if [ -n "$_r" ]; then
+            echo "maze-sb-sign: WARNING - packaged shim $_cv would revoke ${_img##*/} ($_r); keeping shim $_lv until systemd is updated" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# No stored shim at all (lost, or an install that never copied one): the
+# packaged one is all there is.
+if [ ! -s "$SHIM_LKG" ] && [ -s "$SHIM_PKG" ] && ms_signed "$SHIM_PKG"; then
+    promote_shim && echo "maze-sb-sign: no stored shim — using the packaged shim $(shim_version "$SHIM_LKG")"
+fi
+
+if [ -s "$SHIM_PKG" ] && [ -s "$SHIM_LKG" ] && ! cmp -s "$SHIM_PKG" "$SHIM_LKG"; then
+    _pkg_sum="$(file_sha256 "$SHIM_PKG")"
+    _pend_sum=""; _pend_boot=""
+    [ -r "$SHIM_PENDING" ] && read -r _pend_sum _pend_boot _ < "$SHIM_PENDING" 2>/dev/null || true
+
+    # Settle a trial that has seen a reboot.
+    if [ -n "$_pend_sum" ] && [ "$_pend_boot" != "$(boot_id)" ] && sb_on; then
+        # shellcheck disable=SC1003  # the patterns are literal EFI paths with backslashes
+        case "$(booted_image)" in
+            *'\efi\boot\grubx64.efi')
+                if [ "$_pend_sum" = "$_pkg_sum" ] && promote_shim; then
+                    echo "maze-sb-sign: shim $(shim_version "$SHIM_LKG") booted this machine with Secure Boot on — it is now the last known good"
+                fi ;;
+            *'\efi\maze-recovery\'*)
+                printf '%s\n' "$_pend_sum" >> "$SHIM_REJECTED"
+                rm -f "$SHIM_PENDING"
+                echo "maze-sb-sign: WARNING - this boot came through the RECOVERY chain while a new shim was on trial." >&2
+                echo "maze-sb-sign:   Assuming the new shim failed: going back to the last known good one." >&2
+                echo "maze-sb-sign:   If the new shim was not the problem: sudo maze-sb-sign --retry-shim" >&2 ;;
+        esac
+    fi
+    # The package moved on while a trial was running: that trial is void.
+    if [ -r "$SHIM_PENDING" ] && [ "$_pend_sum" != "$_pkg_sum" ]; then
+        rm -f "$SHIM_PENDING"
+    fi
+
+    if ! cmp -s "$SHIM_PKG" "$SHIM_LKG" && shim_candidate_ok; then
+        # Is the last known good dead anyway? Then there is nothing to protect.
+        _dead="$(fw_revocations | revokes "$SHIM_LKG" || true)"
+        [ -n "$_dead" ] || _dead="$(shim_applies "$SHIM_PKG" | revokes "$SHIM_LKG" || true)"
+        if [ -n "$_dead" ]; then
+            if promote_shim; then
+                echo "maze-sb-sign: installed shim $(shim_version "$SHIM_LKG") everywhere (the previous shim is revoked: $_dead)"
+            fi
+        else
+            SHIM_PRIMARY="$SHIM_PKG"
+            [ -f "$MM_PKG" ] && MM_PRIMARY="$MM_PKG"
+            if ! cmp -s "$SHIM_PKG" "$BOOTDIR/BOOTX64.EFI" 2>/dev/null || [ ! -r "$SHIM_PENDING" ]; then
+                ( umask 077; printf '%s %s\n' "$_pkg_sum" "$(boot_id)" > "$SHIM_PENDING" ) || true
+                echo "maze-sb-sign: shim $(shim_version "$SHIM_PKG") is on trial in EFI/BOOT; the recovery entry keeps shim $(shim_version "$SHIM_LKG") until it has booted this machine"
+            fi
+        fi
+    fi
+elif [ -r "$SHIM_PENDING" ]; then
+    rm -f "$SHIM_PENDING"               # package and last known good agree again
+fi
+
+# Shim and MokManager are a pair: both from the same source.
+if install_atomic "$SHIM_PRIMARY" "$BOOTDIR/BOOTX64.EFI"; then :; else
+    echo "maze-sb-sign: FAIL   could not install shim as $BOOTDIR/BOOTX64.EFI" >&2
+    status_ok=0
+fi
+install_atomic "$MM_PRIMARY" "$BOOTDIR/mmx64.efi" || true
+install_if_diff "$CER" "$ESP/MOK.cer"
 
 # --- Sign the UKI and install as grubx64.efi (shim's second stage) ---
 # /etc/kernel/install.conf ships `layout=uki`, so `kernel-install add` (run by
@@ -884,8 +1119,10 @@ install_recovery() {
     fi
 
     mkdir -p "$RECOVERY_DIR" || { echo "maze-sb-sign: WARNING - cannot create $RECOVERY_DIR" >&2; return 0; }
-    install_if_diff "$KEYDIR/shimx64.efi" "$RECOVERY_DIR/BOOTX64.EFI" || true
-    install_if_diff "$KEYDIR/mmx64.efi"   "$RECOVERY_DIR/mmx64.efi"   || true
+    # The LAST KNOWN GOOD shim, never one on trial: this chain is the way back
+    # when a new shim in EFI/BOOT does not boot (see "Which shim goes on the ESP").
+    install_atomic "$SHIM_LKG" "$RECOVERY_DIR/BOOTX64.EFI" || true
+    install_atomic "$MM_LKG"   "$RECOVERY_DIR/mmx64.efi"   || true
 
     # Temp file and rename, for the same reason as grubx64.efi: a truncated
     # image that looks bootable is worse than no image at all.

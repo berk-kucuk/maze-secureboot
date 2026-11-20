@@ -1,3 +1,12 @@
+# Last hook of the transaction: verify the boot chain end to end and raise the
+# boot-unsafe flag if a reboot would not come back.
+#
+# Its triggers must cover everything 85-maze-kernel-install.hook rebuilds the
+# UKIs for. They used to stop at the kernel, the stub and the cmdline, so a
+# microcode, cryptsetup, firmware or Plymouth update rebuilt every boot image
+# with nothing checking the result until maze-boot-check.timer — 3 minutes
+# AFTER the reboot it existed to guard.
+
 [Trigger]
 Type = Path
 Operation = Install
@@ -7,6 +16,23 @@ Target = usr/lib/modules/*/vmlinuz
 Target = usr/lib/systemd/boot/efi/*
 Target = etc/kernel/cmdline
 Target = etc/mkinitcpio.conf
+Target = etc/mkinitcpio.conf.d/*
+# Same set as 85-maze-kernel-install.hook: what goes INTO the initramfs.
+Target = usr/lib/initcpio/*
+Target = usr/lib/firmware/*
+Target = usr/lib/modules/*/extramodules/
+Target = usr/src/*/dkms.conf
+Target = usr/lib/systemd/systemd
+Target = usr/lib/systemd/systemd-udevd
+Target = usr/bin/cryptsetup
+Target = usr/bin/lvm
+Target = usr/bin/mdadm
+Target = usr/lib/libcryptsetup.so
+Target = usr/lib/libp11-kit.so
+Target = usr/lib/libpcsclite.so
+Target = usr/lib/modprobe.d/
+Target = boot/*-ucode.img
+Target = usr/share/plymouth/themes/*
 
 [Trigger]
 Type = Package
@@ -16,6 +42,7 @@ Operation = Remove
 Target = systemd
 Target = mkinitcpio
 Target = maze-secureboot
+Target = shim-signed
 
 [Action]
 Description = Verifying the boot chain before you can reboot into it (Maze)...

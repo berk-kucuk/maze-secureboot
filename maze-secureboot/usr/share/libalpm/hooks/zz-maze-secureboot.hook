@@ -21,6 +21,8 @@ Target = nvidia-utils
 Target = dkms
 Target = mkinitcpio
 Target = systemd
+# A new shim goes onto the ESP on trial (see maze-sb-sign).
+Target = shim-signed
 
 [Action]
 Description = Signing bootloader and kernels for Secure Boot (Maze)...

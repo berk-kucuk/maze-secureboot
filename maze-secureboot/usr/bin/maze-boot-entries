@@ -52,7 +52,9 @@
 set -u
 
 LABELS="Maze Linux
-Maze Linux (recovery kernel)"
+Maze Linux (recovery kernel)
+Maze Linux (no shim, Secure Boot off)
+Maze Linux (recovery kernel, no shim)"
 
 CLEAN=0
 YES=0
@@ -129,6 +131,12 @@ target_exists() {
     _mp="$(findmnt -no TARGET --source "$_dev" 2>/dev/null | head -n 1)"
     if [ -n "$_mp" ]; then
         [ -e "$_mp/$_file" ] && return 0
+        # Maze mounts the ESP with umask=0077: a normal user cannot even list
+        # it, so "not there" would only mean "not allowed to look". That used to
+        # report every entry but the booted one as DEAD when run without sudo.
+        if [ "$(id -u)" -ne 0 ] && { [ ! -r "$_mp" ] || [ ! -x "$_mp" ]; }; then
+            return 2
+        fi
         return 1
     fi
 
@@ -155,12 +163,14 @@ echo
 
 # ── Pass 1: describe every entry ────────────────────────────────────────────
 
-printf '  %-6s %-34s %s\n' "Entry" "Label" "Status"
-printf '  %-6s %-34s %s\n' "-----" "---------------------------------" "------"
+printf '  %-6s %-40s %s\n' "Entry" "Label" "Status"
+printf '  %-6s %-40s %s\n' "-----" "---------------------------------------" "------"
 
 SEEN=""       # "num<TAB>label<TAB>target" of Maze entries we are keeping
 DOOMED=""     # boot numbers to remove
 n_maze=0
+n_shim=0          # Maze entries that start shim — the only ones that boot with Secure Boot on
+n_shim_doomed=0
 n_unsigned_sdboot=0
 
 # Walked from a here-doc rather than a pipe on purpose: a piped `while` runs in
@@ -197,15 +207,16 @@ while IFS= read -r line; do
         # only produces a "Security Violation" screen.
         case "$target" in
             *systemd-boot*x64.efi*)
-                printf '  %-6s %-34s %s\n' "$num" "$label" "not Maze - left alone (UNSIGNED systemd-boot; cannot boot with Secure Boot on)"
+                printf '  %-6s %-40s %s\n' "$num" "$label" "not Maze - left alone (UNSIGNED systemd-boot; cannot boot with Secure Boot on)"
                 n_unsigned_sdboot=$((n_unsigned_sdboot + 1)) ;;
             *)
-                printf '  %-6s %-34s %s\n' "$num" "$label" "not Maze - left alone" ;;
+                printf '  %-6s %-40s %s\n' "$num" "$label" "not Maze - left alone" ;;
         esac
         continue
     fi
 
     n_maze=$((n_maze + 1))
+    case "$label" in *"no shim"*) _via_shim=0 ;; *) _via_shim=1; n_shim=$((n_shim + 1)) ;; esac
     status=""
 
     if [ "$num" = "$CURRENT" ]; then
@@ -218,6 +229,7 @@ while IFS= read -r line; do
         if printf '%s\n' "$SEEN" | grep -Fxq "$key"; then
             status="DUPLICATE of an entry above"
             DOOMED="$DOOMED $num"
+            [ "$_via_shim" = 0 ] || n_shim_doomed=$((n_shim_doomed + 1))
         elif [ "$_te" -eq 1 ]; then
             if [ -b "/dev/disk/by-partuuid/$guid" ]; then
                 status="DEAD - nothing at that path any more"
@@ -225,6 +237,7 @@ while IFS= read -r line; do
                 status="DEAD - its partition no longer exists"
             fi
             DOOMED="$DOOMED $num"
+            [ "$_via_shim" = 0 ] || n_shim_doomed=$((n_shim_doomed + 1))
         elif [ "$_te" -eq 2 ]; then
             # Could not verify. Kept on purpose, and said out loud so nobody
             # assumes silence meant it was checked.
@@ -243,7 +256,7 @@ while IFS= read -r line; do
             SEEN="$SEEN
 $label	$target" ;;
     esac
-    printf '  %-6s %-34s %s\n' "$num" "$label" "$status"
+    printf '  %-6s %-40s %s\n' "$num" "$label" "$status"
 done <<ENTRIES_EOF
 $ENTRIES
 ENTRIES_EOF
@@ -267,8 +280,10 @@ if [ "$n_doomed" -eq 0 ]; then
     exit 0
 fi
 
-if [ "$n_maze" -le "$n_doomed" ]; then
-    echo "  Refusing to act: that would remove every Maze boot entry."
+# The "no shim" entries only start with Secure Boot OFF, so they do not count as
+# a survivor: what must remain is at least one entry that goes through shim.
+if [ "$n_maze" -le "$n_doomed" ] || { [ "$n_shim" -gt 0 ] && [ "$n_shim" -le "$n_shim_doomed" ]; }; then
+    echo "  Refusing to act: that would remove every Maze boot entry that starts shim."
     echo "  Something about this machine does not match what this tool expects."
     echo
     exit 1

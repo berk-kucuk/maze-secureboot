@@ -1,0 +1,153 @@
+#!/bin/sh
+# Managed by Maze Linux (maze-secureboot).
+#
+# maze-sb-mok-cleanup — remove Secure Boot keys this machine no longer needs
+# from the MOK list, so they stop being trusted.
+#
+# Usage:
+#   maze-sb-mok-cleanup              show what is enrolled and what would go
+#   maze-sb-mok-cleanup --apply      ask MokManager to delete it (next boot)
+#   maze-sb-mok-cleanup --keep-iso   leave the live-ISO key enrolled
+#
+# WHAT IT REMOVES, AND WHY
+#
+#   * The Maze LIVE-ISO key. Booting the installer with Secure Boot on means
+#     enrolling it, and it then stays enrolled for good. The installed system
+#     never uses it — it boots with its own per-machine key — but every image
+#     signed with the ISO key keeps booting here, and that one key is shared by
+#     every Maze machine that ever enrolled it. Removing it leaves trust where
+#     it belongs: the key generated for THIS machine.
+#     The only cost: booting a Maze live USB with Secure Boot on later means
+#     enrolling its MOK.cer again from MokManager (same steps as the first time).
+#
+#   * Machine keys of EARLIER installs on this computer. Their private halves
+#     went with the disk that was reinstalled, so they sign nothing any more;
+#     they are clutter, not a risk, and go along for the same price.
+#
+# WHAT IT NEVER TOUCHES
+#
+#   The current machine key, a key in the middle of maze-sb-rotate-key, and any
+#   key that is not Maze's (another distribution's, or shim's built-in vendor
+#   certificate). It also refuses to act unless every boot image on the ESP
+#   verifies with the current machine key — removing a key something still
+#   needs would make that entry stop booting.
+#
+# Deleting a MOK entry needs a person at the blue MokManager screen on the next
+# boot, with a one-time password chosen now. If that screen is skipped, nothing
+# changes; 'sudo mokutil --revoke-delete' withdraws the request.
+set -u
+
+SELF=maze-sb-mok-cleanup
+KEYDIR=/var/lib/maze-secureboot
+CER="$KEYDIR/MOK.cer"
+CRT="$KEYDIR/MOK.crt"
+ISO_CER=/usr/share/maze-secureboot/live-iso-mok.cer
+ISO_SUBJECT="CN=Maze Linux Secure Boot"
+MACHINE_SUBJECT="CN=Maze Linux Secure Boot machine key"
+
+say()  { echo "$SELF: $*"; }
+die()  { echo "$SELF: ERROR - $*" >&2; exit 1; }
+
+APPLY=0
+KEEP_ISO=0
+ESP=""
+for a in "$@"; do
+    case "$a" in
+        --apply)    APPLY=1 ;;
+        --keep-iso) KEEP_ISO=1 ;;
+        -h|--help)  sed -n '4,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*)         die "unknown option '$a'" ;;
+        *)          ESP="$a" ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "must be run as root (sudo $SELF)"
+for _t in mokutil openssl sbverify; do
+    command -v "$_t" >/dev/null 2>&1 || die "'$_t' is not installed"
+done
+[ -r "$CER" ] && [ -r "$CRT" ] || die "this machine has no MOK key in $KEYDIR"
+
+if mokutil --test-key "$CER" 2>/dev/null | grep -qi 'already enrolled'; then :; else
+    die "this machine's own key is not enrolled — nothing is removed until it is (see: sudo maze-boot-check)"
+fi
+[ -e "$KEYDIR/rotate/state" ] && die "a key rotation is in progress (maze-sb-rotate-key status); finish or cancel it first"
+if mokutil --list-new 2>/dev/null | grep -qi 'fingerprint' \
+   || mokutil --list-delete 2>/dev/null | grep -qi 'fingerprint'; then
+    die "MokManager already has a pending request (mokutil --list-new / --list-delete); finish or revoke it first"
+fi
+
+TMP="$(mktemp -d /run/maze-mok-cleanup.XXXXXX)" || die "cannot create a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+( cd "$TMP" && mokutil --export >/dev/null 2>&1 ) || die "mokutil --export failed"
+
+subject_of() { openssl x509 -inform DER -in "$1" -noout -subject 2>/dev/null | sed 's/^subject= *//'; }
+
+say "keys this machine trusts through MOK:"
+DOOMED=""
+n_doomed=0
+for f in "$TMP"/MOK-*.der; do
+    [ -f "$f" ] || continue
+    subj="$(subject_of "$f")"
+    if cmp -s "$f" "$CER"; then
+        verdict="keep   - this machine's key"
+    elif [ "$subj" = "$ISO_SUBJECT" ] || { [ -r "$ISO_CER" ] && cmp -s "$f" "$ISO_CER"; }; then
+        if [ "$KEEP_ISO" = 1 ]; then
+            verdict="keep   - Maze live-ISO key (--keep-iso)"
+        else
+            verdict="REMOVE - Maze live-ISO key (the installed system never uses it)"
+            DOOMED="$DOOMED $f"; n_doomed=$((n_doomed + 1))
+        fi
+    else
+        case "$subj" in
+            "$MACHINE_SUBJECT"*)
+                verdict="REMOVE - machine key of an earlier install (its private key is gone)"
+                DOOMED="$DOOMED $f"; n_doomed=$((n_doomed + 1)) ;;
+            *)
+                verdict="keep   - not a Maze key" ;;
+        esac
+    fi
+    printf '  %-60s %s\n' "${subj:-<unreadable certificate>}" "$verdict"
+done
+
+if [ "$n_doomed" -eq 0 ]; then
+    say "nothing to remove."
+    exit 0
+fi
+
+# Every image shim may be asked to start must already verify with THIS
+# machine's key; otherwise one of the keys above may still be what it needs.
+[ -n "$ESP" ] || ESP="$(bootctl --print-esp-path 2>/dev/null || true)"
+[ -n "$ESP" ] && [ -d "$ESP/EFI" ] || ESP=/boot
+[ -d "$ESP/EFI" ] || ESP=/efi
+[ -d "$ESP/EFI" ] || die "no ESP found (pass its mount point as an argument)"
+bad=0
+for img in "$ESP/EFI/BOOT/grubx64.efi" "$ESP/EFI/maze-recovery/grubx64.efi"; do
+    [ -f "$img" ] || continue
+    if ! (sbverify --cert "$CRT" "$img") >/dev/null 2>&1; then
+        echo "$SELF: ${img#"$ESP"/} does not verify with this machine's key" >&2
+        bad=1
+    fi
+done
+[ -f "$ESP/EFI/BOOT/grubx64.efi" ] || { echo "$SELF: $ESP/EFI/BOOT/grubx64.efi is missing" >&2; bad=1; }
+[ "$bad" = 0 ] || die "not removing anything until the boot images are signed with this machine's key (sudo maze-sb-sign --force-bootloader)"
+
+if [ "$APPLY" != 1 ]; then
+    echo
+    say "nothing was changed. To ask MokManager to remove the $n_doomed key(s) marked REMOVE:"
+    say "  sudo $SELF --apply"
+    exit 0
+fi
+
+echo
+say "mokutil will now ask for a ONE-TIME password. You type it once more in the"
+say "blue MokManager screen on the next boot; it is not kept after that."
+# shellcheck disable=SC2086  # one argument per exported certificate file
+mokutil --delete $DOOMED || die "mokutil --delete failed; nothing was changed"
+echo
+say "Done. Next: reboot. In the blue MokManager screen choose:"
+say "  Delete MOK -> Continue -> Yes -> (that password) -> Reboot"
+say "If you skip the screen nothing changes ('sudo mokutil --revoke-delete' withdraws it)."
+if [ "$KEEP_ISO" != 1 ]; then
+    say "To boot a Maze live USB with Secure Boot on later, enroll its MOK.cer again"
+    say "from MokManager ('Enroll key from disk'), as on the first install."
+fi

@@ -26,17 +26,19 @@ this package, so every existing Maze install picks it up on the next
 
 | Path | Role |
 |---|---|
-| `/usr/bin/maze-sb-sign` | Signs the UKI with the machine MOK, installs it as `EFI/BOOT/grubx64.efi` (shim's second stage), reinstalls shim, keeps a rollback copy, prunes stale UKIs. Also keeps the firmware entries: "Maze Linux (recovery kernel)" via shim, plus **"Maze Linux (no shim, Secure Boot off)"** and "Maze Linux (recovery kernel, no shim)", which start the UKIs directly — the way in if shim itself ever breaks (disable Secure Boot, pick it from the firmware boot menu). All appended at the end of BootOrder. `flock`-serialised. |
+| `/usr/bin/maze-sb-sign` | Signs the UKI with the machine MOK, installs it as `EFI/BOOT/grubx64.efi` (shim's second stage), keeps shim current (see *Shim updates* below), keeps a rollback copy, prunes stale UKIs. Also keeps the firmware entries: "Maze Linux (recovery kernel)" via shim, plus **"Maze Linux (no shim, Secure Boot off)"** and "Maze Linux (recovery kernel, no shim)", which start the UKIs directly — the way in if shim itself ever breaks (disable Secure Boot, pick it from the firmware boot menu). All appended at the end of BootOrder. `flock`-serialised. |
 | `/usr/bin/maze-kernel-install-add` | Runs `kernel-install add` for each upgraded kernel — the step stock Arch never performs. |
 | `/usr/share/libalpm/hooks/85-maze-kernel-install.hook` | Fires on `usr/lib/modules/*/vmlinuz`; rebuilds the UKI **before** the re-sign pass. |
 | `/usr/share/libalpm/hooks/zz-maze-secureboot.hook` | Idempotent re-sign after kernel/nvidia/dkms/mkinitcpio/systemd changes. |
 | `/usr/bin/maze-sb-rotate-key` | Opt-in, never run automatically. Replaces the machine MOK key so every image ever signed with the old one stops booting (MOK has no revocation list). Staged `start` → `continue` → `continue` → `continue`, one MokManager confirmation and reboot per stage; boot images are only ever signed with an already-enrolled key, and the old key is deleted only after the new images have booted. `cancel` backs out of any stage. |
+| `/usr/bin/maze-sb-mok-cleanup` | Opt-in. Asks MokManager to stop trusting keys this machine no longer needs: the Maze **live-ISO key** (shared by every machine that enrolled it; the installed system never boots with it) and machine keys of earlier installs. Never touches the current key, a rotation in progress, or non-Maze keys, and refuses while any boot image still needs another key. `/usr/share/maze-secureboot/live-iso-mok.cer` identifies the ISO key. |
 | `/usr/lib/kernel/install.d/85-maze-sb-trust.install` | Records the sha256 of the UKI `kernel-install add` just built (in `/var/lib/maze-secureboot/trusted-ukis`), before it reaches the ESP. `maze-sb-sign` signs only UKIs listed there whose kernel is installed; anything else on the ESP is reported as REFUSED and left untouched. |
 | `/usr/lib/kernel/install.d/95-maze-sb-sign.install` | Signs inline during every `kernel-install add`, including manual ones. |
 | `/usr/lib/maze-secureboot/kernel-install-add` | Wrapper both rebuild paths use. If `kernel-install add` fails but the new UKI provably reached the ESP (sha256 matches this run's build record), the failure came from a non-Maze plugin running after the boot image was in place — reported as a warning, not as "do NOT reboot". |
 | `/etc/kernel/install.d/99-uki-uefi-setup.install` → `/dev/null` | Masks virt-firmware's plugin, which registers UKIs as direct firmware entries (wrong on a shim chain) and, since 26.10, fails every `kernel-install add` with "shim binary needed but not found". |
 | `/usr/lib/systemd/system/maze-sb-resign.{service,path}` | Self-heal for kernel writes with no pacman transaction. When it fires during a pacman transaction (UKIs still being built), it waits for pacman to finish and signs the final state instead of failing on a half-built set. |
 | `/usr/lib/systemd/system/systemd-boot-update.service.d/99-maze-resign.conf` | Repairs the chain after `bootctl update` overwrites `BOOTX64.EFI`. |
+| `/usr/lib/systemd/system-generators/maze-sulogin-generator` | Decides on every boot whether the emergency/rescue shell may open without a root password (see *The emergency shell* below). |
 
 **Refusing to let you reboot into a broken chain**
 
@@ -75,7 +77,7 @@ lock anyone out of their computer.
 ## What stays per-machine (installer-owned, not packaged)
 
 * `/var/lib/maze-secureboot/MOK.{key,crt,cer}` — the per-machine signing key
-* `/var/lib/maze-secureboot/{shim,mm}x64.efi` — shim binaries copied off the ISO
+* `/var/lib/maze-secureboot/{shim,mm}x64.efi` — the **last known good** shim: copied off the ISO at install, replaced only by a newer `shim-signed` that has booted this machine
 * `/etc/kernel/cmdline` and `/etc/kernel/install.conf` (`layout=uki`)
 * the `Maze Linux` NVRAM boot entry, and `ENROLLMENT.txt`
 
@@ -87,12 +89,73 @@ replace the kernel); `maze-boot-check` keeps it root-only and puts loose
 permissions right. What protects it from everyone else is the disk: on an
 encrypted install, someone with the disk in hand cannot read it. On an
 **unencrypted** disk they can copy it and sign a boot image this machine will
-trust — Secure Boot then still stops changed images from software on the
-running system, but not that. The installer says so (in the log and in
-`ENROLLMENT.txt`), and `maze-boot-check` reports it as a `[NOTE]` (not a
-failure: nothing about the next boot is broken). With encryption, binding the
-unlock to the TPM (`systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`) also
-makes a changed boot chain fail to unlock the disk.
+trust. The installer says so (in the log and in `ENROLLMENT.txt`), and
+`maze-boot-check` reports it as a `[NOTE]` (not a failure: nothing about the
+next boot is broken).
+
+Be clear about what Secure Boot covers here: it stops someone with the disk
+(but not the passphrase) from changing what boots. It does **not** stop root on
+the running system — root can read the key, and every rebuild signs whatever
+initramfs and cmdline root configured. And because the Microsoft third-party CA
+is in the firmware's db, it does not stop another vendor's signed boot chain
+either.
+
+There is no TPM unlock: the busybox `encrypt` hook never reads LUKS2 tokens, so
+`systemd-cryptenroll --tpm2-device=...` enrols something nothing uses. (Earlier
+versions of `maze-boot-check` recommended it.) PCR 7 alone would also be a poor
+policy: it does not change when an older image signed with the same key boots.
+
+### Optional: firmware and MokManager passwords
+
+Neither is set by Maze, because a forgotten one costs more than it protects for
+most people. Both close the same physical-access hole and are worth it if you
+can keep them safe:
+
+* a **firmware setup password** stops others from turning Secure Boot off;
+* `sudo mokutil --password` makes MokManager ask for a password, so nobody can
+  enrol a key of their own from the blue screen.
+
+## Shim updates
+
+`shim-signed` is a dependency, and `maze-sb-sign` treats its
+`/usr/share/shim-signed/shimx64.efi` as a *candidate*, never as a given — a new
+shim writes its own SBAT revocations into firmware the first time it runs, and
+that cannot be undone:
+
+1. **Checked first:** Microsoft-signed; its generation not revoked by the
+   firmware (`SbatLevelRT`); not older than the last known good; and the
+   revocations it would apply must not revoke the systemd-stub the UKIs are
+   built on.
+2. **Trial:** it goes into `EFI/BOOT` only; `EFI/maze-recovery` keeps the last
+   known good shim.
+3. **Promotion:** after a boot with Secure Boot on that came through the primary
+   chain (systemd-stub's `StubImageIdentifier`), it becomes the last known good
+   and the recovery chain follows.
+4. **Rejection:** if that boot came through the recovery entry instead, it is
+   recorded in `/var/lib/maze-secureboot/shim-rejected` and the last known good
+   goes back. `sudo maze-sb-sign --retry-shim` offers it again.
+
+If the last known good is itself revoked, the candidate goes everywhere at once
+(there is nothing left to protect). `maze-boot-check` reports a trial, a
+rejection, and any shim on the ESP the firmware has revoked.
+
+## The emergency shell
+
+Root is locked on Maze, and `sulogin` refuses a locked account, so a failed
+mount would leave no shell at all. `maze-sulogin-generator` sets
+`SULOGIN_FORCE=1` for `emergency.service` and `rescue.service` **only** when
+reaching that shell proves the disk passphrase was typed: the root is unlocked
+by the busybox `encrypt` hook (`cryptdevice=`), with no `cryptkey=`, no
+`/crypto_keyfile.bin` in the initramfs, and not via `rd.luks*`. Anywhere else —
+an unencrypted disk included — `sulogin` asks for the root password as usual.
+
+The earlier static drop-ins assumed the sealed cmdline made emergency mode
+unreachable at will; that is only true with Secure Boot on, and Secure Boot can
+usually be switched off by whoever sits at the machine.
+
+Overrides: `/etc/maze/sulogin-force` (always allow) and
+`/etc/maze/sulogin-never` (never). `.../maze-sulogin-generator --status` prints
+the current decision.
 
 ## Migration off the old layout
 

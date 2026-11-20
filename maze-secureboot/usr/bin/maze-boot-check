@@ -171,9 +171,19 @@ fi
 
 # --- 2) a UKI for every installed kernel ------------------------------------
 
+# The UKI of kernel $1. The name only finds candidates: "*7.0.1-arch1-1.efi"
+# also matches a 17.0.1-arch1-1 image, so the version inside the image (.uname)
+# has the last word whenever it can be read.
 uki_for() {
     for _f in "$ESP"/EFI/Linux/*"$1".efi; do
-        if [ -f "$_f" ]; then printf '%s\n' "$_f"; return 0; fi
+        [ -f "$_f" ] || continue
+        if command -v objcopy >/dev/null 2>&1; then
+            _uu="$(objcopy -O binary --only-section=.uname "$_f" /dev/stdout 2>/dev/null \
+                    | tr -d '\0' | tr -d '[:space:]')"
+            [ -z "$_uu" ] || [ "$_uu" = "$1" ] || continue
+        fi
+        printf '%s\n' "$_f"
+        return 0
     done
     return 1
 }
@@ -289,19 +299,79 @@ fi
 
 # --- 5) shim ----------------------------------------------------------------
 
+# Two shims are legitimate in EFI/BOOT: the last known good one
+# ($KEYDIR/shimx64.efi) and, while it is on trial, the packaged one. See
+# "Which shim goes on the ESP" in maze-sb-sign.
 SHIM="$ESP/EFI/BOOT/BOOTX64.EFI"
+SHIM_LKG="$KEYDIR/shimx64.efi"
+SHIM_PKG=/usr/share/shim-signed/shimx64.efi
+RECO_SHIM="$ESP/EFI/maze-recovery/BOOTX64.EFI"
+
+# Revocations the running firmware enforces, from SbatLevelRT
+# ("component,min-generation" per line; empty when unknown).
+fw_revocations() {
+    _fv=/sys/firmware/efi/efivars/SbatLevelRT-605dab50-e046-4300-abb6-3dd810dd8b23
+    [ -r "$_fv" ] || return 0
+    tail -c +5 "$_fv" 2>/dev/null | tr -d '\0' | awk -F, 'NF == 2 { print $1 "," $2 }'
+}
+# Prints "component gen<min" when the firmware has revoked image $1.
+fw_revoked() {
+    command -v objcopy >/dev/null 2>&1 || return 1
+    _have="$(objcopy -O binary --only-section=.sbat "$1" /dev/stdout 2>/dev/null \
+              | tr -d '\0' | awk -F, 'NF >= 2 && $2 ~ /^[0-9]+$/ { print $1 "," $2 }')"
+    [ -n "$_have" ] || return 1
+    for _rl in $(fw_revocations); do
+        _rc="${_rl%%,*}"; _rm="${_rl#*,}"
+        [ "$_rc" = sbat ] && continue
+        _g="$(printf '%s\n' "$_have" | awk -F, -v c="$_rc" '$1 == c { print $2; exit }')"
+        [ -n "$_g" ] || continue
+        if [ "$_g" -lt "$_rm" ]; then printf '%s %s<%s\n' "$_rc" "$_g" "$_rm"; return 0; fi
+    done
+    return 1
+}
+
 if [ ! -r "$CRT" ]; then
     :
 elif [ ! -s "$SHIM" ]; then
     bad "shim missing: $SHIM" \
         "The first link of the Secure Boot chain is gone." \
         "sudo maze-sb-sign --force-bootloader"
-elif [ -r "$KEYDIR/shimx64.efi" ] && ! cmp -s "$KEYDIR/shimx64.efi" "$SHIM"; then
+elif [ -r "$SHIM_LKG" ] && ! cmp -s "$SHIM_LKG" "$SHIM" \
+     && ! { [ -r "$SHIM_PKG" ] && cmp -s "$SHIM_PKG" "$SHIM"; }; then
     bad "BOOTX64.EFI is not the expected shim binary" \
         "'bootctl update' may have overwritten it with an unsigned systemd-boot." \
         "sudo maze-sb-sign --force-bootloader"
 else
-    ok "shim in place (BOOTX64.EFI)"
+    if [ -r "$KEYDIR/shim-pending" ] && [ -r "$SHIM_PKG" ] && cmp -s "$SHIM_PKG" "$SHIM"; then
+        ok "shim in place (BOOTX64.EFI) - a new shim is on trial; the recovery entry keeps the previous one"
+        say "          It becomes the default after one reboot with Secure Boot on."
+    else
+        ok "shim in place (BOOTX64.EFI)"
+    fi
+    if [ -s "$KEYDIR/shim-rejected" ] && [ -r "$SHIM_PKG" ] && ! cmp -s "$SHIM_PKG" "$SHIM"; then
+        note "The packaged shim failed its trial boot here, so the previous one is still in use" \
+             "(that boot came through the recovery entry). To offer it again:" \
+             "sudo maze-sb-sign --retry-shim"
+    fi
+fi
+
+# --- 5b) has the firmware revoked a shim we boot through? -------------------
+# SBAT revocations arrive with firmware, fwupd and Windows updates. A revoked
+# shim stops booting with Secure Boot on, all at once, with nothing on the
+# running system changing — so this is checked against the firmware's own list.
+if [ -r "$CRT" ] && [ -s "$SHIM" ] && [ -n "$(fw_revocations)" ]; then
+    if _rv="$(fw_revoked "$SHIM")"; then
+        bad "shim in EFI/BOOT is revoked by this firmware ($_rv)" \
+            "With Secure Boot on the firmware will refuse it: the machine will not start." \
+            "sudo pacman -Syu shim-signed && sudo maze-sb-sign --force-bootloader"
+    else
+        ok "shim is not revoked by the firmware's SBAT list"
+    fi
+    if [ -s "$RECO_SHIM" ] && _rv="$(fw_revoked "$RECO_SHIM")"; then
+        note "The recovery entry's shim is revoked by this firmware ($_rv)" \
+             "The recovery entry cannot start with Secure Boot on until it is replaced:" \
+             "sudo pacman -Syu shim-signed && sudo maze-sb-sign"
+    fi
 fi
 
 # --- 6) MOK enrolled, if Secure Boot is actually on -------------------------
@@ -317,7 +387,34 @@ elif mokutil --test-key "$KEYDIR/MOK.cer" 2>/dev/null | grep -qi 'already enroll
 else
     bad "Secure Boot is on but the MOK is not enrolled" \
         "The firmware will not trust the signed image; boot lands in MokManager." \
-        "sudo mokutil --import $KEYDIR/MOK.cer   (then reboot and pick 'Enroll key from disk')"
+        "sudo mokutil --import $KEYDIR/MOK.cer   (asks for a one-time password; on reboot pick 'Enroll MOK' in MokManager and type it)"
+fi
+
+# Neither can be read from a running system, and both close the same hole:
+# without them anyone at the keyboard can turn Secure Boot off, or enrol a key
+# of their own in MokManager in half a minute. Optional, and said once here.
+if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'secureboot[[:space:]]*enabled'; then
+    skip "Firmware setup password / MokManager password: cannot be checked from Linux (both optional)"
+    say "          A firmware setup password stops others from turning Secure Boot off;"
+    say "          'sudo mokutil --password' protects MokManager. Write them down if you set them."
+
+    # Keys that are trusted here but no longer needed. The live-ISO key matters
+    # most: it is shared by every machine that enrolled it, and the installed
+    # system never boots with it. Not a failure — nothing about the next boot
+    # depends on it — just trust that can be taken back.
+    _subj="$(mokutil --list-enrolled 2>/dev/null | sed -n 's/^[[:space:]]*Subject:[[:space:]]*//p')"
+    _iso_n="$(printf '%s\n' "$_subj" | grep -cx 'CN=Maze Linux Secure Boot' || true)"
+    _mk_n="$(printf '%s\n' "$_subj" | grep -c '^CN=Maze Linux Secure Boot machine key' || true)"
+    # During maze-sb-rotate-key two machine keys are expected: say nothing then.
+    [ -e "$KEYDIR/rotate/state" ] && _mk_n=1
+    if [ "${_iso_n:-0}" -gt 0 ] || [ "${_mk_n:-0}" -gt 1 ]; then
+        _what=""
+        [ "${_iso_n:-0}" -gt 0 ] && _what="the Maze live-ISO key"
+        [ "${_mk_n:-0}" -gt 1 ] && _what="${_what:+$_what and }$((_mk_n - 1)) machine key(s) of earlier installs"
+        note "Secure Boot still trusts $_what" \
+             "This system boots with its own key only. Review and remove them with:" \
+             "sudo maze-sb-mok-cleanup   (then --apply; confirm in MokManager on the next boot)"
+    fi
 fi
 
 # --- 6b) the signing key itself ---------------------------------------------
@@ -352,9 +449,12 @@ elif [ -n "$_key_src" ]; then
     note "The signing key is stored on a disk that is NOT encrypted ($_key_src)" \
          "Secure Boot here stops changed boot images from software on this machine," \
          "but not someone with the disk in hand: they can copy $KEYDIR/MOK.key" \
-         "and sign their own. Full-disk encryption (re-install with it) closes that;" \
-         "with it, binding the unlock to the TPM also makes a changed boot chain" \
-         "fail to unlock:  sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 <LUKS device>"
+         "and sign their own. Full-disk encryption (re-install with it) closes that."
+    # This used to recommend `systemd-cryptenroll --tpm2-pcrs=7`. Maze's initramfs
+    # uses the busybox `encrypt` hook, which never reads LUKS2 tokens, so that
+    # enrolment did nothing. Made to work (sd-encrypt), PCR 7 alone would be
+    # worse than nothing: it does not change when an OLDER image signed with the
+    # same key boots, so the disk would unlock itself for a downgraded chain.
 else
     skip "Could not tell which disk holds $KEYDIR"
 fi
@@ -375,14 +475,31 @@ if [ ! -r "$CMDLINE_FILE" ]; then
         "This is where the kernel command line comes from when the UKI is built." \
         "Restore the cmdline from the install, then: sudo maze-boot-check --repair"
 elif grep -q 'cryptdevice=\|rd.luks' "$CMDLINE_FILE" 2>/dev/null; then
-    _hooks="$(sed -n 's/^[[:space:]]*HOOKS=[(]\(.*\)[)].*/\1/p' /etc/mkinitcpio.conf 2>/dev/null)"
+    # HOOKS as mkinitcpio itself ends up with it: /etc/mkinitcpio.conf first,
+    # then every /etc/mkinitcpio.conf.d/*.conf in order, the last assignment
+    # winning. Reading only the main file passed a drop-in that replaces HOOKS
+    # without `encrypt` — the live ISO's archiso.conf did exactly that once.
+    _hooks="" _hooks_from=""
+    for _c in /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf; do
+        [ -r "$_c" ] || continue
+        _h="$(sed -n 's/^[[:space:]]*HOOKS=[(]\(.*\)[)].*/\1/p' "$_c" 2>/dev/null | tail -n 1)"
+        [ -n "$_h" ] && { _hooks="$_h"; _hooks_from="$_c"; }
+    done
+    # The two hooks read different parameters: `encrypt` wants cryptdevice=,
+    # `sd-encrypt` wants rd.luks.*. The wrong pair asks for nothing at boot.
+    _want=encrypt
+    grep -q 'cryptdevice=' "$CMDLINE_FILE" 2>/dev/null || _want=sd-encrypt
     case " $_hooks " in
+        *" $_want "*)
+            ok "LUKS root: the $_want hook is configured in the initramfs (${_hooks_from:-?})" ;;
         *" encrypt "*|*" sd-encrypt "*)
-            ok "LUKS root: the encrypt hook is configured in the initramfs" ;;
+            bad "LUKS root: the cmdline needs the '$_want' hook, but HOOKS (${_hooks_from}) has the other one" \
+                "Each hook ignores the other's parameters: the disk would never be unlocked." \
+                "Use '$_want' in HOOKS of ${_hooks_from}, then: sudo maze-boot-check --repair" ;;
         *)
-            bad "Root is LUKS but mkinitcpio HOOKS has no encrypt hook" \
+            bad "Root is LUKS but mkinitcpio HOOKS (${_hooks_from:-/etc/mkinitcpio.conf}) has no encrypt hook" \
                 "The machine boots, cannot unlock its disk, and never asks for the passphrase." \
-                "Add 'encrypt' to HOOKS in /etc/mkinitcpio.conf, then: sudo maze-boot-check --repair" ;;
+                "Add '$_want' to HOOKS in ${_hooks_from:-/etc/mkinitcpio.conf}, then: sudo maze-boot-check --repair" ;;
     esac
 else
     skip "Root is not encrypted - encrypt hook not required"
